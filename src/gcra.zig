@@ -176,11 +176,12 @@ test "check: retry_after_ns is accurate" {
 }
 
 test "check: burst=5 allows 6 requests at t=0" {
-    const interval: i64 = 10_000_000; // 10ms → 100 req/s
-    const burst_off = interval * 5; // burst of 5 extra
+    const interval: i64 = 10_000_000;
+    const burst_off = interval * 5;
     const now: i64 = 1_000_000_000;
     var tat: i64 = 0;
 
+    // 1 base + 5 burst = 6 total
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         const d = check(tat, now, interval, burst_off);
