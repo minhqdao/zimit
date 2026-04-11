@@ -14,10 +14,10 @@ jobs:
                 zig-version: ["0.15.2"]
         steps:
             - name: Checkout Actions
-              uses: actions/checkout@v4
+              uses: actions/checkout@v6
 
             - name: Install Zig
-              uses: mlugg/setup-zig@v1
+              uses: mlugg/setup-zig@v2
               with:
                   version: ${{ matrix.zig-version }}
 
