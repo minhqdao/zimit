@@ -16,7 +16,7 @@
 //!
 //!     switch (try limiter.allow("192.168.1.1")) {
 //!         .allowed => handleRequest(),
-//!         .denied  => |d| return error429(d.retry_after_ms),
+//!         .denied  => |d| return error429(d.retry_after_ms_ceil),
 //!     }
 
 const std = @import("std");
@@ -80,13 +80,65 @@ pub const Outcome = union(enum) {
         retry_after_ns: i64,
 
         /// Convenience: retry delay in whole milliseconds (rounded up).
-        pub fn retry_after_ms(self: @This()) i64 {
+        pub fn retry_after_ms_ceil(self: @This()) i64 {
             return @divTrunc(self.retry_after_ns + 999_999, 1_000_000);
         }
     },
 
     pub fn is_allowed(self: Outcome) bool {
         return self == .allowed;
+    }
+};
+
+// ── GlobalLimiter ─────────────────────────────────────────────────────────────
+
+/// A lock-free single-key rate limiter with a token-bucket-flavored API.
+///
+/// Use this for process-wide or service-wide limits that are shared across
+/// threads — for example, "this service may make at most N outbound calls/s".
+///
+/// For per-key limits use `RateLimiter(K)`.
+pub const GlobalLimiter = struct {
+    inner: gcra.AtomicLimiter,
+
+    pub fn init(cfg: struct {
+        rate: u32,
+        per: Period,
+        burst: u32 = 0,
+        clock: Clock,
+    }) ZimitError!GlobalLimiter {
+        const limit = Limit{
+            .count = cfg.rate,
+            .period_ns = cfg.per.to_ns(),
+        };
+        return .{ .inner = try gcra.AtomicLimiter.init(limit, cfg.burst, cfg.clock) };
+    }
+
+    pub fn allow(self: *GlobalLimiter) Outcome {
+        return self.allow_n(1);
+    }
+
+    pub fn allow_n(self: *GlobalLimiter, n: u32) Outcome {
+        return switch (self.inner.allow_n(n)) {
+            .allowed => .allowed,
+            .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
+        };
+    }
+
+    /// Block the calling thread until allowed.
+    /// Same design seam as `RateLimiter.wait` — replace with fiber suspension
+    /// once Zig 0.16.0 async lands.
+    pub fn wait(self: *GlobalLimiter) void {
+        while (true) {
+            switch (self.allow()) {
+                .allowed => return,
+                .denied => |d| std.time.sleep(@intCast(d.retry_after_ns)),
+            }
+        }
+    }
+
+    pub fn reset(self: *GlobalLimiter) void {
+        self.inner.reset();
     }
 };
 
@@ -235,7 +287,7 @@ test "RateLimiter: allow — exhausted key is denied" {
     try std.testing.expect(!out.is_allowed());
 }
 
-test "RateLimiter: allow — retry_after_ms rounds up" {
+test "RateLimiter: allow — retry_after_ms_ceil rounds up" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // 1 req/s → emission interval = 1 000 000 000 ns = 1000 ms
@@ -248,7 +300,7 @@ test "RateLimiter: allow — retry_after_ms rounds up" {
         .denied => |d| {
             // retry_after_ns should be ~1s; ms should round up to 1000
             try std.testing.expect(d.retry_after_ns > 0);
-            try std.testing.expectEqual(@as(i64, 1000), d.retry_after_ms());
+            try std.testing.expectEqual(@as(i64, 1000), d.retry_after_ms_ceil());
         },
         .allowed => return error.TestUnexpectedResult,
     }
@@ -422,4 +474,68 @@ test "RateLimiter: sustained throughput over simulated minute" {
     }
     // Expect exactly 6 000 allowed (100/s × 60s)
     try std.testing.expectEqual(@as(usize, 6_000), allowed);
+}
+
+test "GlobalLimiter: basic allow and deny" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try GlobalLimiter.init(.{
+        .rate = 5,
+        .per = .second,
+        .burst = 4, // 1 base + 4 burst = 5
+        .clock = mc.clock(),
+    });
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try std.testing.expectEqual(true, lim.allow().is_allowed());
+    }
+    try std.testing.expectEqual(false, lim.allow().is_allowed());
+}
+
+test "GlobalLimiter: reset restores capacity" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try GlobalLimiter.init(.{
+        .rate = 1,
+        .per = .second,
+        .burst = 0,
+        .clock = mc.clock(),
+    });
+
+    _ = lim.allow();
+    try std.testing.expectEqual(false, lim.allow().is_allowed());
+    lim.reset();
+    try std.testing.expectEqual(true, lim.allow().is_allowed());
+}
+
+test "GlobalLimiter: allow_n batch" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try GlobalLimiter.init(.{
+        .rate = 10,
+        .per = .second,
+        .burst = 0,
+        .clock = mc.clock(),
+    });
+
+    try std.testing.expectEqual(true, lim.allow_n(8).is_allowed());
+    try std.testing.expectEqual(false, lim.allow_n(4).is_allowed());
+}
+
+test "GlobalLimiter: retry_after_ms_ceil is non-zero on denial" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try GlobalLimiter.init(.{
+        .rate = 1,
+        .per = .second,
+        .burst = 0,
+        .clock = mc.clock(),
+    });
+
+    _ = lim.allow();
+    switch (lim.allow()) {
+        .denied => |d| try std.testing.expect(d.retry_after_ms_ceil() > 0),
+        .allowed => return error.TestUnexpectedResult,
+    }
 }

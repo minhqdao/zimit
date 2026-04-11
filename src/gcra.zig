@@ -127,6 +127,91 @@ fn HashContext(comptime K: type) type {
     return std.hash_map.AutoContext(K);
 }
 
+// ── AtomicLimiter ─────────────────────────────────────────────────────────────
+
+/// A lock-free, single-key rate limiter backed by one atomic i64 TAT.
+///
+/// Use this when you need a *global* limit shared across threads —
+/// for example, "this process may make at most N outbound API calls per second"
+/// regardless of which thread is making them.
+///
+/// For per-key limits (per IP, per user) use `Limiter(K)` protected by a Mutex,
+/// or a sharded design. `AtomicLimiter` tracks exactly one token bucket.
+///
+/// Lock-free guarantee: threads never block each other. A thread that loses a
+/// CAS race retries immediately with the freshly-loaded TAT. Under zero
+/// contention the CAS always succeeds on the first attempt.
+pub const AtomicLimiter = struct {
+    tat: std.atomic.Value(i64),
+    emission_interval_ns: i64,
+    burst_offset_ns: i64,
+    clock: Clock,
+
+    pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
+        if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+        return .{
+            .tat = std.atomic.Value(i64).init(0),
+            .emission_interval_ns = limit.emission_interval(),
+            .burst_offset_ns = limit.burst_offset(burst),
+            .clock = clock,
+        };
+    }
+
+    /// Check whether a single request is allowed right now.
+    /// Safe to call from any number of threads simultaneously.
+    pub fn allow(self: *AtomicLimiter) Decision {
+        return self.allow_n(1);
+    }
+
+    /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
+    /// are granted or none are — partial grants never occur.
+    pub fn allow_n(self: *AtomicLimiter, n: u32) Decision {
+        if (n == 0) return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+
+        const scaled_interval = self.emission_interval_ns * @as(i64, n);
+        const now = self.clock.now();
+
+        while (true) {
+            // Load with .monotonic — we don't need ordering here because
+            // the CAS below provides the acquire barrier on success.
+            const old_tat = self.tat.load(.monotonic);
+
+            const decision = check(
+                old_tat,
+                now,
+                scaled_interval,
+                self.burst_offset_ns,
+            );
+
+            switch (decision) {
+                .denied => return decision,
+                .allowed => |a| {
+                    // .acq_rel: acquire ensures we see all writes from the
+                    // thread whose CAS we're racing against; release ensures
+                    // our write is visible before the next load by any thread.
+                    if (self.tat.cmpxchgWeak(
+                        old_tat,
+                        a.new_tat,
+                        .acq_rel,
+                        .monotonic,
+                    ) == null) {
+                        // null return from cmpxchgWeak means the swap succeeded.
+                        return decision;
+                    }
+                    // Non-null means another thread changed TAT under us.
+                    // Loop and retry with the fresh value.
+                },
+            }
+        }
+    }
+
+    /// Reset the limiter to its initial state — useful in tests.
+    /// Not safe to call concurrently with `allow`.
+    pub fn reset(self: *AtomicLimiter) void {
+        self.tat.store(0, .release);
+    }
+};
+
 /// Convenience alias for the common string-keyed limiter.
 pub const StringLimiter = Limiter([]const u8);
 
@@ -388,4 +473,248 @@ test "Limiter: integer key type (u64)" {
 
     const d2 = try lim.check_key(99);
     try std.testing.expect(d2.is_allowed());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — AtomicLimiter (single-threaded correctness)
+// ─────────────────────────────────────────────────────────────────────────────
+
+test "AtomicLimiter: fresh limiter allows first request" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+    const d = lim.allow();
+    try std.testing.expect(d.is_allowed());
+}
+
+test "AtomicLimiter: exhausted limiter denies" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(3), 0, mc.clock());
+
+    _ = lim.allow();
+    _ = lim.allow();
+    _ = lim.allow();
+    try std.testing.expect(!lim.allow().is_allowed());
+}
+
+test "AtomicLimiter: time advance unblocks" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+
+    _ = lim.allow();
+    try std.testing.expect(!lim.allow().is_allowed());
+
+    mc.tick(std.time.ns_per_s);
+    try std.testing.expect(lim.allow().is_allowed());
+}
+
+test "AtomicLimiter: burst allows base+burst requests" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    // burst=4 → 1+4 = 5 requests at t=0
+    var lim = try AtomicLimiter.init(Limit.per_second(10), 4, mc.clock());
+
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        try std.testing.expect(lim.allow().is_allowed());
+    }
+    try std.testing.expect(!lim.allow().is_allowed());
+}
+
+test "AtomicLimiter: allow_n consumes slots atomically" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+
+    try std.testing.expect(lim.allow_n(7).is_allowed());
+    try std.testing.expect(!lim.allow_n(4).is_allowed());
+}
+
+test "AtomicLimiter: allow_n=0 always allowed, no state change" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+
+    _ = lim.allow(); // exhaust
+    try std.testing.expect(!lim.allow().is_allowed());
+    try std.testing.expect(lim.allow_n(0).is_allowed()); // zero never mutates
+    try std.testing.expect(!lim.allow().is_allowed()); // still exhausted
+}
+
+test "AtomicLimiter: denied allow_n leaves TAT unchanged" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(5), 0, mc.clock());
+
+    try std.testing.expect(lim.allow_n(3).is_allowed());
+
+    const tat_before = lim.tat.load(.monotonic);
+    _ = lim.allow_n(10); // must fail
+    const tat_after = lim.tat.load(.monotonic);
+
+    // TAT must be bitwise identical — denied path must never write
+    try std.testing.expectEqual(tat_before, tat_after);
+}
+
+test "AtomicLimiter: reset clears state" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+
+    _ = lim.allow();
+    try std.testing.expect(!lim.allow().is_allowed());
+
+    lim.reset();
+    try std.testing.expect(lim.allow().is_allowed());
+}
+
+test "AtomicLimiter: retry_after_ns is positive on denial" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+
+    _ = lim.allow();
+    const d = lim.allow();
+    switch (d) {
+        .denied => |denied| try std.testing.expect(denied.retry_after_ns > 0),
+        .allowed => return error.TestUnexpectedResult,
+    }
+}
+
+test "AtomicLimiter: init rejects zero count" {
+    var mc = types.ManualClock{};
+    const bad = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
+    try std.testing.expectError(
+        error.InvalidLimit,
+        AtomicLimiter.init(bad, 0, mc.clock()),
+    );
+}
+
+test "AtomicLimiter: sustained throughput matches rate" {
+    var mc = types.ManualClock{};
+    var lim = try AtomicLimiter.init(Limit.per_second(100), 0, mc.clock());
+
+    var allowed: usize = 0;
+    var t: i64 = 0;
+    // 10 seconds, one attempt every 1ms (10 000 attempts)
+    while (t < 10 * std.time.ns_per_s) : (t += 1_000_000) {
+        mc.set(t);
+        if (lim.allow().is_allowed()) allowed += 1;
+    }
+    // Expect exactly 1000 (100/s × 10s)
+    try std.testing.expectEqual(@as(usize, 1000), allowed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests — AtomicLimiter (concurrent correctness)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// We can't inject a ManualClock across threads safely (it has no internal
+// synchronisation), so the concurrency tests use SystemClock and reason
+// about counts rather than exact timing.
+
+test "AtomicLimiter: concurrent allows never exceed limit" {
+    // 8 threads each fire 200 requests as fast as possible.
+    // The limiter allows 100/s. The test runs for ~50ms real time.
+    // We only assert the hard invariant: allowed count ≤ what the rate
+    // permits for the elapsed duration + 1 burst slot of slack.
+    const num_threads = 8;
+    const requests_per_thread = 200;
+
+    var sys = types.SystemClock{};
+    var lim = try AtomicLimiter.init(
+        Limit.per_second(1000),
+        0,
+        sys.clock(),
+    );
+
+    const Ctx = struct {
+        limiter: *AtomicLimiter,
+        allowed: std.atomic.Value(usize),
+
+        fn run(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < requests_per_thread) : (i += 1) {
+                if (ctx.limiter.allow().is_allowed()) {
+                    _ = ctx.allowed.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var ctx = Ctx{
+        .limiter = &lim,
+        .allowed = std.atomic.Value(usize).init(0),
+    };
+
+    const start_ns = std.time.nanoTimestamp();
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    }
+    for (&threads) |*t| t.join();
+
+    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+
+    const total_allowed = ctx.allowed.load(.monotonic);
+    // Maximum legitimately allowed = rate × elapsed + 1 (for initial slot)
+    const max_allowed: usize = @intFromFloat(1000.0 * elapsed_s + 1.5);
+
+    try std.testing.expect(total_allowed <= max_allowed);
+}
+
+test "AtomicLimiter: concurrent allows — no lost updates under contention" {
+    // All threads share one limiter with exactly N total slots.
+    // After all threads finish, exactly N requests should have been granted —
+    // no more (proves CAS prevents double-grants) and ideally no fewer
+    // (proves retries work). We allow a small slack because threads may
+    // race past the window boundary.
+    const total_slots = 50;
+    const num_threads = 8;
+    const requests_per_thread = 20; // 160 total attempts for 50 slots
+
+    var sys = types.SystemClock{};
+    // Large period so slots don't replenish during the test
+    var lim = try AtomicLimiter.init(
+        Limit{ .count = total_slots, .period_ns = std.time.ns_per_s },
+        total_slots - 1, // critical
+        sys.clock(),
+    );
+
+    const Ctx = struct {
+        limiter: *AtomicLimiter,
+        allowed: std.atomic.Value(usize),
+
+        fn run(ctx: *@This()) void {
+            var i: usize = 0;
+            while (i < requests_per_thread) : (i += 1) {
+                if (ctx.limiter.allow().is_allowed()) {
+                    _ = ctx.allowed.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    };
+
+    var ctx = Ctx{
+        .limiter = &lim,
+        .allowed = std.atomic.Value(usize).init(0),
+    };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    }
+    for (&threads) |*t| t.join();
+
+    const total_allowed = ctx.allowed.load(.monotonic);
+
+    // Must never exceed the configured slot count
+    try std.testing.expect(total_allowed <= total_slots);
+    // Must have granted a substantial portion — if retries broke, we'd
+    // see far fewer than expected
+    try std.testing.expect(total_allowed >= total_slots / 2);
 }

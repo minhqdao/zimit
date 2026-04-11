@@ -11,7 +11,7 @@ Exposes a token-bucket-flavored API while running a Generic Cell Rate Algorithm
 - Multi-key `HashMap`-backed limiter for strings, integers, or any hashable type
 - Manual clock injection — deterministic tests without sleeping
 - Atomic batch requests via `allow_n`
-- `retry_after_ns` / `retry_after_ms` on every denial — caller decides how to wait
+- `retry_after_ns` / `retry_after_ms_ceil` on every denial — caller decides how to wait
 
 ## Installation
 
@@ -50,6 +50,6 @@ defer limiter.deinit();
 
 switch (try limiter.allow("192.168.1.1")) {
     .allowed => handleRequest(),
-    .denied  => |d| sendTooManyRequests(d.retry_after_ms()),
+    .denied  => |d| sendTooManyRequests(d.retry_after_ms_ceil()),
 }
 ```

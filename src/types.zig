@@ -90,7 +90,7 @@ pub const SystemClock = struct {
     }
 
     fn now_impl(_: *anyopaque) i64 {
-        return std.time.nanoTimestamp();
+        return @intCast(std.time.nanoTimestamp());
     }
 };
 
@@ -167,6 +167,42 @@ test "Decision.retry_after_ns" {
     const denied = Decision{ .denied = .{ .retry_after_ns = 5_000_000 } };
     try std.testing.expectEqual(@as(?i64, null), allowed.retry_after_ns());
     try std.testing.expectEqual(@as(?i64, 5_000_000), denied.retry_after_ns());
+}
+
+test "SystemClock: monotonic non-decreasing without sleep" {
+    var sys = SystemClock{};
+    const clk = sys.clock();
+
+    var prev = clk.now();
+
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        const now = clk.now();
+        try std.testing.expect(now >= prev);
+        prev = now;
+    }
+}
+
+test "SystemClock: returns positive i64" {
+    var sys = SystemClock{};
+    const clk = sys.clock();
+
+    const t = clk.now();
+    try std.testing.expect(t > 0);
+}
+
+test "SystemClock: multiple calls are non-decreasing" {
+    var sys = SystemClock{};
+    const clk = sys.clock();
+
+    var prev = clk.now();
+
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        const now = clk.now();
+        try std.testing.expect(now >= prev);
+        prev = now;
+    }
 }
 
 test "ManualClock: starts at zero" {
