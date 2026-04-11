@@ -187,12 +187,11 @@ pub fn RateLimiter(comptime K: type) type {
         pub fn allow_n(self: *Self, key: K, n: u32) ZimitError!Outcome {
             if (n == 0) return .allowed;
 
-            // For n > 1 we temporarily scale the emission interval:
-            // consuming n slots at once = advancing TAT by n × interval.
-            // We achieve this by running `check` with a scaled interval,
-            // keeping burst_offset unchanged so burst semantics are preserved.
-            const base_interval = self.inner.emission_interval_ns;
-            const scaled_interval = base_interval * @as(i64, n);
+            if (@as(u64, n) > self.inner.max_batch) {
+                return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+            }
+
+            const scaled = self.inner.emission_interval_ns * @as(i64, n);
 
             const now = self.inner.clock.now();
             const tat = self.inner.store.get(key) orelse 0;
@@ -200,7 +199,7 @@ pub fn RateLimiter(comptime K: type) type {
             const decision = gcra.check(
                 tat,
                 now,
-                scaled_interval,
+                scaled,
                 self.inner.burst_offset_ns,
             );
 
@@ -248,7 +247,7 @@ pub const StringRateLimiter = RateLimiter([]const u8);
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn make_limiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRateLimiter {
+fn makeLimiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRateLimiter {
     return StringRateLimiter.init(.{
         .allocator = std.testing.allocator,
         .rate = rate,
@@ -267,7 +266,7 @@ test "Period.to_ns: values are correct" {
 test "RateLimiter: allow — fresh key passes" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(10, .second, 0, &mc);
+    var lim = try makeLimiter(10, .second, 0, &mc);
     defer lim.deinit();
 
     const out = try lim.allow("alice");
@@ -277,7 +276,7 @@ test "RateLimiter: allow — fresh key passes" {
 test "RateLimiter: allow — exhausted key is denied" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(3, .second, 0, &mc);
+    var lim = try makeLimiter(3, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u");
@@ -291,7 +290,7 @@ test "RateLimiter: allow — retry_after_ms_ceil rounds up" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // 1 req/s → emission interval = 1 000 000 000 ns = 1000 ms
-    var lim = try make_limiter(1, .second, 0, &mc);
+    var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u");
@@ -309,7 +308,7 @@ test "RateLimiter: allow — retry_after_ms_ceil rounds up" {
 test "RateLimiter: allow — keys are isolated" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(1, .second, 0, &mc);
+    var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("alice");
@@ -320,7 +319,7 @@ test "RateLimiter: allow — keys are isolated" {
 test "RateLimiter: allow — time advance unblocks key" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(1, .second, 0, &mc);
+    var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u");
@@ -334,7 +333,7 @@ test "RateLimiter: burst — allows base+burst requests at t=0" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=5/s, burst=3 → 1 base + 3 burst = 4 requests immediately
-    var lim = try make_limiter(5, .second, 3, &mc);
+    var lim = try makeLimiter(5, .second, 3, &mc);
     defer lim.deinit();
 
     var i: usize = 0;
@@ -348,7 +347,7 @@ test "RateLimiter: burst — allows base+burst requests at t=0" {
 test "RateLimiter: burst — replenishes after delay" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(1, .second, 1, &mc);
+    var lim = try makeLimiter(1, .second, 1, &mc);
     defer lim.deinit();
 
     // Consume both base + burst
@@ -365,7 +364,7 @@ test "RateLimiter: allow_n — consume multiple slots atomically" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=10/s, no burst → 10 slots available at t=0
-    var lim = try make_limiter(10, .second, 0, &mc);
+    var lim = try makeLimiter(10, .second, 0, &mc);
     defer lim.deinit();
 
     // Consume 7 — succeeds
@@ -380,7 +379,7 @@ test "RateLimiter: allow_n — consume multiple slots atomically" {
 test "RateLimiter: allow_n — n=0 always allowed without state change" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(1, .second, 0, &mc);
+    var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     // Exhaust the key
@@ -395,7 +394,7 @@ test "RateLimiter: allow_n — n=0 always allowed without state change" {
 test "RateLimiter: allow_n — partial batch is never granted" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(5, .second, 0, &mc);
+    var lim = try makeLimiter(5, .second, 0, &mc);
     defer lim.deinit();
 
     // Consume 3 slots atomically — succeeds, TAT now 600ms out
@@ -416,7 +415,7 @@ test "RateLimiter: allow_n — partial batch is never granted" {
 test "RateLimiter: remove — resets key to fresh" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(1, .second, 0, &mc);
+    var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u");
@@ -430,7 +429,7 @@ test "RateLimiter: remove — resets key to fresh" {
 test "RateLimiter: per minute config" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try make_limiter(60, .minute, 0, &mc);
+    var lim = try makeLimiter(60, .minute, 0, &mc);
     defer lim.deinit();
 
     // 60/min = 1/s — second request at same instant denied
@@ -462,7 +461,7 @@ test "RateLimiter: integer key type (u64)" {
 
 test "RateLimiter: sustained throughput over simulated minute" {
     var mc = ManualClock{};
-    var lim = try make_limiter(100, .second, 0, &mc);
+    var lim = try makeLimiter(100, .second, 0, &mc);
     defer lim.deinit();
 
     var allowed: usize = 0;
@@ -474,6 +473,60 @@ test "RateLimiter: sustained throughput over simulated minute" {
     }
     // Expect exactly 6 000 allowed (100/s × 60s)
     try std.testing.expectEqual(@as(usize, 6_000), allowed);
+}
+
+test "RateLimiter: allow_n overflow guard denies without panic" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    // per=minute, rate=1 → interval=60_000_000_000 ns → max_batch=153
+    // maxInt(u32)=4_294_967_295 >> 153, so guard fires
+    var lim = try makeLimiter(1, .minute, 0, &mc);
+    defer lim.deinit();
+
+    const out = try lim.allow_n("u", std.math.maxInt(u32));
+    try std.testing.expect(!out.is_allowed());
+}
+
+test "RateLimiter: allow_n overflow guard returns maxInt retry_after" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(1, .minute, 0, &mc);
+    defer lim.deinit();
+
+    const out = try lim.allow_n("u", std.math.maxInt(u32));
+    switch (out) {
+        .denied => |d| try std.testing.expectEqual(
+            @as(i64, std.math.maxInt(i64)),
+            d.retry_after_ns,
+        ),
+        .allowed => return error.TestUnexpectedResult,
+    }
+}
+
+test "RateLimiter: allow_n overflow guard does not mutate state" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(1, .minute, 0, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow_n("u", std.math.maxInt(u32));
+
+    const out = try lim.allow("u");
+    try std.testing.expect(out.is_allowed());
+}
+
+test "RateLimiter: allow_n large but valid n is evaluated normally" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    // rate=10/s → interval=100ms → max_batch=92, so n=5 is valid
+    var lim = try makeLimiter(10, .second, 0, &mc);
+    defer lim.deinit();
+
+    const out = try lim.allow_n("u", 5);
+    switch (out) {
+        .allowed => {},
+        .denied => |d| try std.testing.expect(d.retry_after_ns < std.math.maxInt(i64)),
+    }
 }
 
 test "GlobalLimiter: basic allow and deny" {

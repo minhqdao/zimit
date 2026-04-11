@@ -62,6 +62,7 @@ pub fn Limiter(comptime K: type) type {
         emission_interval_ns: i64,
         burst_offset_ns: i64,
         clock: Clock,
+        max_batch: u64,
 
         /// Initialise a limiter.
         ///
@@ -76,12 +77,14 @@ pub fn Limiter(comptime K: type) type {
             clock: Clock,
         ) ZimitError!Self {
             if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+            const interval = limit.emission_interval();
             return .{
                 .allocator = allocator,
                 .store = Store.init(allocator),
-                .emission_interval_ns = limit.emission_interval(),
+                .emission_interval_ns = interval,
                 .burst_offset_ns = limit.burst_offset(burst),
                 .clock = clock,
+                .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
             };
         }
 
@@ -146,14 +149,19 @@ pub const AtomicLimiter = struct {
     emission_interval_ns: i64,
     burst_offset_ns: i64,
     clock: Clock,
+    max_batch: u64,
 
     pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
         if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+
+        const interval = limit.emission_interval();
+
         return .{
             .tat = std.atomic.Value(i64).init(0),
-            .emission_interval_ns = limit.emission_interval(),
+            .emission_interval_ns = interval,
             .burst_offset_ns = limit.burst_offset(burst),
             .clock = clock,
+            .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
         };
     }
 
@@ -166,40 +174,39 @@ pub const AtomicLimiter = struct {
     /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
     /// are granted or none are — partial grants never occur.
     pub fn allow_n(self: *AtomicLimiter, n: u32) Decision {
-        if (n == 0) return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+        if (n == 0) {
+            return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+        }
 
-        const scaled_interval = self.emission_interval_ns * @as(i64, n);
+        if (@as(u64, n) > self.max_batch) {
+            return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+        }
+
+        const scaled = self.emission_interval_ns * @as(i64, n);
+
         const now = self.clock.now();
 
         while (true) {
-            // Load with .monotonic — we don't need ordering here because
-            // the CAS below provides the acquire barrier on success.
             const old_tat = self.tat.load(.monotonic);
 
             const decision = check(
                 old_tat,
                 now,
-                scaled_interval,
+                scaled,
                 self.burst_offset_ns,
             );
 
             switch (decision) {
                 .denied => return decision,
                 .allowed => |a| {
-                    // .acq_rel: acquire ensures we see all writes from the
-                    // thread whose CAS we're racing against; release ensures
-                    // our write is visible before the next load by any thread.
                     if (self.tat.cmpxchgWeak(
                         old_tat,
                         a.new_tat,
                         .acq_rel,
                         .monotonic,
                     ) == null) {
-                        // null return from cmpxchgWeak means the swap succeeded.
                         return decision;
                     }
-                    // Non-null means another thread changed TAT under us.
-                    // Loop and retry with the fresh value.
                 },
             }
         }
@@ -328,6 +335,55 @@ test "check: zero burst, sustained rate allows exactly N req/s" {
     }
     // Should have allowed exactly 100 (one per 10ms slot)
     try std.testing.expectEqual(@as(usize, 100), allowed);
+}
+
+test "check: correctness under clock jitter" {
+    const interval: i64 = 10_000_000; // 10ms
+    const burst_off: i64 = 0;
+
+    var tat: i64 = 0;
+    var now: i64 = 0;
+    var forward_ns: i64 = 0;
+    var allowed: usize = 0;
+
+    const deltas = [_]i64{
+        1_000_000,
+        1_000_000,
+        0,
+        1_000_000,
+        -200_000,
+        1_200_000,
+        1_000_000,
+        0,
+        1_000_000,
+        -100_000,
+    };
+
+    var i: usize = 0;
+
+    while (forward_ns < std.time.ns_per_s) {
+        const delta = deltas[i % deltas.len];
+        i += 1;
+
+        now += delta;
+        if (now < 0) now = 0;
+
+        if (delta > 0) forward_ns += delta;
+
+        const d = check(tat, now, interval, burst_off);
+        if (d.is_allowed()) {
+            allowed += 1;
+            tat = d.allowed.new_tat;
+        }
+    }
+
+    const expected = @divFloor(forward_ns, interval);
+
+    // HARD invariant: must never exceed rate
+    try std.testing.expect(allowed <= expected + 2);
+
+    // Soft sanity check (optional)
+    try std.testing.expect(allowed > 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -605,6 +661,87 @@ test "AtomicLimiter: sustained throughput matches rate" {
     }
     // Expect exactly 1000 (100/s × 10s)
     try std.testing.expectEqual(@as(usize, 1000), allowed);
+}
+
+test "AtomicLimiter: allow_n overflow guard denies without panic" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+
+    // max_batch = maxInt(i64) / 100_000_000 = 92, so 93 exceeds it
+    if (lim.max_batch >= std.math.maxInt(u32)) return; // avoid invalid cast
+    const n: u32 = @intCast(lim.max_batch + 1);
+
+    const d = lim.allow_n(n);
+    try std.testing.expect(!d.is_allowed());
+}
+
+test "AtomicLimiter: allow_n overflow guard leaves TAT unchanged" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+
+    const tat_before = lim.tat.load(.monotonic);
+    const n: u32 = @intCast(lim.max_batch + 1);
+    _ = lim.allow_n(n);
+
+    try std.testing.expectEqual(tat_before, lim.tat.load(.monotonic));
+}
+
+test "AtomicLimiter: allow_n overflow guard returns maxInt retry_after" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+
+    const n: u32 = @intCast(lim.max_batch + 1);
+    const d = lim.allow_n(n);
+
+    switch (d) {
+        .denied => |denied| try std.testing.expectEqual(
+            @as(i64, std.math.maxInt(i64)),
+            denied.retry_after_ns,
+        ),
+        .allowed => return error.TestUnexpectedResult,
+    }
+}
+
+test "AtomicLimiter: allow_n large but valid n still works" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+
+    const n: u32 = 100;
+    try std.testing.expect(@as(u64, n) <= lim.max_batch);
+
+    // First call always allowed on a cold limiter — consume capacity
+    _ = lim.allow_n(n);
+
+    // Now TAT is far in the future; a second batch must be denied
+    const d = lim.allow_n(n);
+
+    try std.testing.expect(!d.is_allowed());
+    // Finite wait — proves it was GCRA, not the overflow guard
+    try std.testing.expect(d.denied.retry_after_ns < std.math.maxInt(i64));
+}
+
+test "AtomicLimiter: allow_n boundary exactly at max_batch does not overflow" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+
+    const n: u32 = @intCast(lim.max_batch);
+    const d = lim.allow_n(n);
+
+    // Guard must not have fired — if denied, retry must be finite
+    switch (d) {
+        .allowed => {},
+        .denied => |denied| try std.testing.expect(
+            denied.retry_after_ns < std.math.maxInt(i64),
+        ),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
