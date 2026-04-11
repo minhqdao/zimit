@@ -20,7 +20,7 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zimit = .{
-        .url = "https://github.com/YOUR_USERNAME/zimit/archive/COMMIT_OR_TAG.tar.gz",
+        .url = "https://github.com/minhqdao/zimit/archive/0.1.0.tar.gz",
         .hash = "...", // paste the hash zig tells you on first build
     },
 },
@@ -53,7 +53,3 @@ switch (try limiter.allow("192.168.1.1")) {
     .denied  => |d| sendTooManyRequests(d.retry_after_ms()),
 }
 ```
-
-## License
-
-MIT
