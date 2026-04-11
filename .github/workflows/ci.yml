@@ -1,0 +1,29 @@
+name: CI
+
+on: push
+
+jobs:
+    test:
+        name: Tests — Zig ${{ matrix.zig-version }} — ${{ matrix.os }}
+        runs-on: ${{ matrix.os }}
+
+        strategy:
+            fail-fast: false
+            matrix:
+                os: [ubuntu-latest, macos-latest, windows-latest]
+                zig-version: ["0.15.2"]
+        steps:
+            - name: Checkout Actions
+              uses: actions/checkout@v4
+
+            - name: Install Zig
+              uses: mlugg/setup-zig@v1
+              with:
+                  version: ${{ matrix.zig-version }}
+
+            - name: Run tests
+              run: zig build test --summary all
+
+            - name: Build docs
+              run: zig build docs
+              # docs are generated but not uploaded yet — just verifying they build
