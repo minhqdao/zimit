@@ -508,6 +508,89 @@ test "RateLimiter: allow_n large but valid n is evaluated normally" {
     }
 }
 
+test "RateLimiter: allow_n — n=1 and allow are equivalent" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim_a = try makeLimiter(5, .second, 0, &mc);
+    defer lim_a.deinit();
+    var lim_b = try makeLimiter(5, .second, 0, &mc);
+    defer lim_b.deinit();
+
+    var i: usize = 0;
+    while (i < 6) : (i += 1) {
+        const a = try lim_a.allow("u");
+        const b = try lim_b.allow_n("u", 1);
+        try std.testing.expectEqual(a.is_allowed(), b.is_allowed());
+    }
+}
+
+test "RateLimiter: remove on absent key is safe" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(5, .second, 0, &mc);
+    defer lim.deinit();
+
+    lim.remove("ghost");
+    try std.testing.expectEqual(@as(usize, 0), lim.key_count());
+}
+
+test "RateLimiter: key_count after mixed allow and remove" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(10, .second, 0, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    _ = try lim.allow("b");
+    _ = try lim.allow("c");
+    try std.testing.expectEqual(@as(usize, 3), lim.key_count());
+
+    lim.remove("b");
+    try std.testing.expectEqual(@as(usize, 2), lim.key_count());
+
+    lim.remove("b"); // second remove is safe
+    try std.testing.expectEqual(@as(usize, 2), lim.key_count());
+}
+
+test "RateLimiter: retry_after_ns is positive on denial" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(1, .second, 0, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("u");
+    const out = try lim.allow("u");
+    switch (out) {
+        .denied => |d| try std.testing.expect(d.retry_after_ns > 0),
+        .allowed => return error.TestUnexpectedResult,
+    }
+}
+
+test "RateLimiter: retry_after_ns decreases as time advances" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(1, .second, 0, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("u");
+
+    const out1 = try lim.allow("u");
+    const wait1 = switch (out1) {
+        .denied => |d| d.retry_after_ns,
+        .allowed => return error.TestUnexpectedResult,
+    };
+
+    mc.tick(std.time.ns_per_s / 2);
+
+    const out2 = try lim.allow("u");
+    const wait2 = switch (out2) {
+        .denied => |d| d.retry_after_ns,
+        .allowed => return error.TestUnexpectedResult,
+    };
+
+    try std.testing.expect(wait2 < wait1);
+}
+
 test "GlobalLimiter: basic allow and deny" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);

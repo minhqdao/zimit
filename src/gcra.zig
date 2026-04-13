@@ -636,6 +636,195 @@ test "Limiter: deinit frees all copied keys without leak" {
     lim.deinit();
 }
 
+test "Limiter: same key does not duplicate allocation" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    _ = try lim.check_key("user");
+    const before = lim.key_count();
+
+    _ = try lim.check_key("user");
+    const after = lim.key_count();
+
+    try std.testing.expectEqual(before, after);
+}
+
+test "Limiter: remove on missing key is safe" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    lim.remove("ghost"); // should not crash
+    try std.testing.expectEqual(@as(usize, 0), lim.key_count());
+}
+
+test "Limiter: many keys do not collide or corrupt" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(1),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        var buf: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "k{}", .{i});
+        _ = try lim.check_key(key);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1000), lim.key_count());
+}
+
+test "Limiter: equal string content with different backing memory hits same key" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(1),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    var buf1 = [_]u8{ 'u', 's', 'e', 'r' };
+    var buf2 = [_]u8{ 'u', 's', 'e', 'r' };
+
+    _ = try lim.check_key(buf1[0..]);
+    const d = try lim.check_key(buf2[0..]);
+
+    try std.testing.expect(!d.is_allowed());
+}
+
+test "Limiter: check_key_n denial does not change state" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(5),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    _ = try lim.check_key_n("u", 3);
+
+    // This should fail
+    _ = try lim.check_key_n("u", 10);
+
+    // Advance exactly 3 slots
+    mc.tick(600 * std.time.ns_per_ms);
+
+    // Should be fresh again
+    try std.testing.expect((try lim.check_key_n("u", 5)).is_allowed());
+}
+
+test "Limiter: retry_after_ns can be zero at boundary" {
+    var mc = types.ManualClock{};
+    mc.set(0);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(1),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    _ = try lim.check_key("u");
+
+    mc.tick(std.time.ns_per_s);
+
+    const d = try lim.check_key("u");
+    try std.testing.expect(d.is_allowed());
+}
+
+test "Limiter: alternating keys do not interfere" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(1),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        const key = if (i % 2 == 0) "a" else "b";
+        _ = try lim.check_key(key);
+    }
+
+    try std.testing.expect(!(try lim.check_key("a")).is_allowed());
+    try std.testing.expect(!(try lim.check_key("b")).is_allowed());
+}
+
+test "Limiter: freed key memory reuse does not corrupt map" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(1),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    {
+        var buf = [_]u8{'a'};
+        _ = try lim.check_key(buf[0..]);
+    } // buf goes out of scope
+
+    // New buffer possibly reuses same memory
+    var buf2 = [_]u8{'a'};
+
+    const d = try lim.check_key(buf2[0..]);
+    try std.testing.expect(!d.is_allowed());
+}
+
+test "Limiter: check_key_n accepts maxInt(u32)" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    const d = try lim.check_key_n("u", std.math.maxInt(u32));
+
+    // Either allowed or denied depending on timing,
+    // but must NOT overflow or panic.
+    _ = d;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests — AtomicLimiter (single-threaded correctness)
 // ─────────────────────────────────────────────────────────────────────────────
