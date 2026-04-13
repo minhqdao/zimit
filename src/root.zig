@@ -16,7 +16,7 @@
 //!
 //!     switch (try limiter.allow("192.168.1.1")) {
 //!         .allowed => handleRequest(),
-//!         .denied  => |d| return error429(d.retry_after_ms_ceil),
+//!         .denied  => |d| return error429(d.retry_after_ms_ceil()),
 //!     }
 
 const std = @import("std");
@@ -40,6 +40,7 @@ pub const Period = enum {
     minute,
     hour,
 
+    /// Converts the period to nanoseconds.
     pub fn to_ns(self: Period) i64 {
         return switch (self) {
             .second => std.time.ns_per_s,
@@ -85,6 +86,7 @@ pub const Outcome = union(enum) {
         }
     },
 
+    /// Returns true if the outcome was allowed.
     pub fn is_allowed(self: Outcome) bool {
         return self == .allowed;
     }
@@ -101,6 +103,7 @@ pub const Outcome = union(enum) {
 pub const GlobalLimiter = struct {
     inner: gcra.AtomicLimiter,
 
+    /// Initialise a global limiter.
     pub fn init(cfg: struct {
         rate: u32,
         per: Period,
@@ -114,10 +117,12 @@ pub const GlobalLimiter = struct {
         return .{ .inner = try gcra.AtomicLimiter.init(limit, cfg.burst, cfg.clock) };
     }
 
+    /// Convenience for `allow_n(1)`.
     pub fn allow(self: *GlobalLimiter) Outcome {
         return self.allow_n(1);
     }
 
+    /// Atomically consume `n` slots.
     pub fn allow_n(self: *GlobalLimiter, n: u32) Outcome {
         return switch (self.inner.allow_n(n)) {
             .allowed => .allowed,
@@ -137,6 +142,7 @@ pub const GlobalLimiter = struct {
         }
     }
 
+    /// Resets the limiter to its initial state.
     pub fn reset(self: *GlobalLimiter) void {
         self.inner.reset();
     }
@@ -167,6 +173,7 @@ pub fn RateLimiter(comptime K: type) type {
             };
         }
 
+        /// Releases all memory owned by the limiter.
         pub fn deinit(self: *Self) void {
             self.inner.deinit();
         }

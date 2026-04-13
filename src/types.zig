@@ -32,14 +32,17 @@ pub const Limit = struct {
 
     // ── Convenience constructors ────────────────────────────────────────────
 
+    /// 1 request per second.
     pub fn per_second(count: u32) Limit {
         return .{ .count = count, .period_ns = std.time.ns_per_s };
     }
 
+    /// 1 request per minute.
     pub fn per_minute(count: u32) Limit {
         return .{ .count = count, .period_ns = 60 * std.time.ns_per_s };
     }
 
+    /// 1 request per hour.
     pub fn per_hour(count: u32) Limit {
         return .{ .count = count, .period_ns = 3600 * std.time.ns_per_s };
     }
@@ -58,10 +61,12 @@ pub const Decision = union(enum) {
     /// suspend a fiber, return a 429, or do something else entirely.
     denied: struct { retry_after_ns: i64 },
 
+    /// Returns true if the request was allowed.
     pub fn is_allowed(self: Decision) bool {
         return self == .allowed;
     }
 
+    /// Returns the retry delay in nanoseconds if denied, else null.
     pub fn retry_after_ns(self: Decision) ?i64 {
         return switch (self) {
             .denied => |d| d.retry_after_ns,
@@ -78,6 +83,7 @@ pub const Clock = struct {
     ptr: *anyopaque,
     now_fn: *const fn (ptr: *anyopaque) i64,
 
+    /// Returns the current time in nanoseconds.
     pub fn now(self: Clock) i64 {
         return self.now_fn(self.ptr);
     }
@@ -85,6 +91,7 @@ pub const Clock = struct {
 
 /// Reads the real system monotonic clock.
 pub const SystemClock = struct {
+    /// Returns a generic `Clock` interface backed by this SystemClock.
     pub fn clock(self: *SystemClock) Clock {
         return .{ .ptr = self, .now_fn = now_impl };
     }
@@ -99,14 +106,17 @@ pub const SystemClock = struct {
 pub const ManualClock = struct {
     time_ns: i64 = 0,
 
+    /// Returns a generic `Clock` interface backed by this ManualClock.
     pub fn clock(self: *ManualClock) Clock {
         return .{ .ptr = self, .now_fn = now_impl };
     }
 
+    /// Sets the clock to an absolute time in nanoseconds.
     pub fn set(self: *ManualClock, ns: i64) void {
         self.time_ns = ns;
     }
 
+    /// Advances the clock by a duration in nanoseconds.
     pub fn tick(self: *ManualClock, ns: i64) void {
         self.time_ns += ns;
     }

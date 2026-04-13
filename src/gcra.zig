@@ -82,6 +82,8 @@ pub fn Limiter(comptime K: type) type {
             };
         }
 
+        /// Releases all memory owned by the limiter.
+        /// If K is a string type, also frees all copied keys.
         pub fn deinit(self: *Self) void {
             if (K == []const u8) {
                 var it = self.store.iterator();
@@ -92,10 +94,15 @@ pub fn Limiter(comptime K: type) type {
             self.store.deinit();
         }
 
+        /// Convenience for `check_key_n(key, 1)`.
         pub fn check_key(self: *Self, key: K) ZimitError!Decision {
             return self.check_key_n(key, 1);
         }
 
+        /// Check whether `key` may make `n` requests atomically.
+        ///
+        /// If K is `[]const u8`, the key is duplicated and owned by the limiter
+        /// if it's the first time we see it.
         pub fn check_key_n(self: *Self, key: K, n: u32) ZimitError!Decision {
             if (n == 0) return .{ .allowed = .{ .new_tat = self.store.get(key) orelse 0 } };
 
@@ -143,6 +150,8 @@ pub fn Limiter(comptime K: type) type {
             return decision;
         }
 
+        /// Remove a key from the store.
+        /// If K is a string type, also frees the copied key memory.
         pub fn remove(self: *Self, key: K) void {
             if (K == []const u8) {
                 if (self.store.fetchRemove(key)) |kv| {
@@ -153,6 +162,7 @@ pub fn Limiter(comptime K: type) type {
             }
         }
 
+        /// Number of keys currently tracked in the store.
         pub fn key_count(self: *const Self) usize {
             return self.store.count();
         }
@@ -186,6 +196,11 @@ pub const AtomicLimiter = struct {
     clock: Clock,
     max_batch: u64,
 
+    /// Initialise an atomic limiter.
+    ///
+    ///   limit  The rate to enforce.
+    ///   burst  Extra requests allowed in a burst (0 = no burst).
+    ///   clock  Time source.
     pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
         if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
 
