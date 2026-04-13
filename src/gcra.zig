@@ -64,12 +64,6 @@ pub fn Limiter(comptime K: type) type {
         clock: Clock,
         max_batch: u64,
 
-        /// Initialise a limiter.
-        ///
-        ///   allocator  Used for the internal HashMap.
-        ///   limit      The rate to enforce.
-        ///   burst      Extra requests allowed in a burst (0 = no burst).
-        ///   clock      Time source. Use SystemClock in prod, ManualClock in tests.
         pub fn init(
             allocator: std.mem.Allocator,
             limit: Limit,
@@ -89,35 +83,76 @@ pub fn Limiter(comptime K: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            if (K == []const u8) {
+                var it = self.store.iterator();
+                while (it.next()) |entry| {
+                    self.allocator.free(entry.key_ptr.*);
+                }
+            }
             self.store.deinit();
         }
 
-        /// Check `key` against the rate limit and update state atomically.
-        /// Returns a `Decision` — caller decides what to do with `.denied`.
         pub fn check_key(self: *Self, key: K) ZimitError!Decision {
+            return self.check_key_n(key, 1);
+        }
+
+        pub fn check_key_n(self: *Self, key: K, n: u32) ZimitError!Decision {
+            if (n == 0) return .{ .allowed = .{ .new_tat = self.store.get(key) orelse 0 } };
+
+            if (@as(u64, n) > self.max_batch) {
+                return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+            }
+
             const now = self.clock.now();
-            const tat = self.store.get(key) orelse 0;
+            const scaled_interval = self.emission_interval_ns * @as(i64, n);
+
+            // Only lookup — never trust existing key memory
+            if (self.store.getEntry(key)) |entry| {
+                const decision = check(
+                    entry.value_ptr.*,
+                    now,
+                    scaled_interval,
+                    self.burst_offset_ns,
+                );
+
+                if (decision == .allowed) {
+                    entry.value_ptr.* = decision.allowed.new_tat;
+                }
+
+                return decision;
+            }
 
             const decision = check(
-                tat,
+                0,
                 now,
-                self.emission_interval_ns,
+                scaled_interval,
                 self.burst_offset_ns,
             );
 
             if (decision == .allowed) {
-                try self.store.put(key, decision.allowed.new_tat);
+                const owned_key: K = if (K == []const u8)
+                    try self.allocator.dupe(u8, key)
+                else
+                    key;
+
+                errdefer if (K == []const u8) self.allocator.free(owned_key);
+
+                try self.store.put(owned_key, decision.allowed.new_tat);
             }
 
             return decision;
         }
 
-        /// Remove a key from the store (e.g. when a user session ends).
         pub fn remove(self: *Self, key: K) void {
-            _ = self.store.remove(key);
+            if (K == []const u8) {
+                if (self.store.fetchRemove(key)) |kv| {
+                    self.allocator.free(kv.key);
+                }
+            } else {
+                _ = self.store.remove(key);
+            }
         }
 
-        /// Current number of tracked keys.
         pub fn key_count(self: *const Self) usize {
             return self.store.count();
         }
@@ -529,6 +564,76 @@ test "Limiter: integer key type (u64)" {
 
     const d2 = try lim.check_key(99);
     try std.testing.expect(d2.is_allowed());
+}
+
+test "Limiter: string key is copied — caller buffer can be mutated" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    // Insert via a mutable stack buffer
+    var buf = [_]u8{ 'u', 's', 'e', 'r' };
+    _ = try lim.check_key(buf[0..]);
+
+    // Mutate the original — if we stored the slice header instead of a copy,
+    // the key in the map is now corrupt
+    buf[0] = 'X';
+
+    // The entry must still be found under the original bytes
+    try std.testing.expectEqual(@as(usize, 1), lim.key_count());
+    const d = try lim.check_key("user");
+    // Second request on same key — should be rate-limited, not treated as fresh
+    try std.testing.expect(!d.is_allowed());
+}
+
+test "Limiter: remove frees copied key memory" {
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+    defer lim.deinit();
+
+    _ = try lim.check_key("alice");
+    _ = try lim.check_key("bob");
+    try std.testing.expectEqual(@as(usize, 2), lim.key_count());
+
+    lim.remove("alice");
+    try std.testing.expectEqual(@as(usize, 1), lim.key_count());
+
+    // alice is gone — next check_key treats her as fresh
+    const d = try lim.check_key("alice");
+    try std.testing.expect(d.is_allowed());
+}
+
+test "Limiter: deinit frees all copied keys without leak" {
+    // This test is only meaningful when run with `zig build test` under the
+    // testing allocator, which detects leaks automatically on deinit.
+    var mc = types.ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try StringLimiter.init(
+        std.testing.allocator,
+        Limit.per_second(10),
+        0,
+        mc.clock(),
+    );
+
+    _ = try lim.check_key("x");
+    _ = try lim.check_key("y");
+    _ = try lim.check_key("z");
+
+    // deinit must free all three copied keys.
+    // If it doesn't, std.testing.allocator reports a leak and the test fails.
+    lim.deinit();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

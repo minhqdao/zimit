@@ -185,29 +185,8 @@ pub fn RateLimiter(comptime K: type) type {
         /// All `n` slots are consumed together or none are — there is no
         /// partial allowance. Useful for batch jobs or chunked uploads.
         pub fn allow_n(self: *Self, key: K, n: u32) ZimitError!Outcome {
-            if (n == 0) return .allowed;
-
-            if (@as(u64, n) > self.inner.max_batch) {
-                return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
-            }
-
-            const scaled = self.inner.emission_interval_ns * @as(i64, n);
-
-            const now = self.inner.clock.now();
-            const tat = self.inner.store.get(key) orelse 0;
-
-            const decision = gcra.check(
-                tat,
-                now,
-                scaled,
-                self.inner.burst_offset_ns,
-            );
-
-            return switch (decision) {
-                .allowed => |a| blk: {
-                    try self.inner.store.put(key, a.new_tat);
-                    break :blk .allowed;
-                },
+            return switch (try self.inner.check_key_n(key, n)) {
+                .allowed => .allowed,
                 .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
             };
         }
