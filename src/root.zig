@@ -2,11 +2,15 @@
 //!
 //! Quick start:
 //!
+//!     const std = @import("std");
 //!     const zimit = @import("zimit");
+//!
+//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+//!     defer _ = gpa.deinit();
 //!
 //!     var sys_clock = zimit.SystemClock{};
 //!     var limiter = try zimit.RateLimiter([]const u8).init(.{
-//!         .allocator = allocator,
+//!         .allocator  = gpa.allocator(),
 //!         .rate       = 100,          // 100 requests …
 //!         .per        = .second,      // … per second
 //!         .burst      = 20,           // allow up to 20 extra in a burst
@@ -137,7 +141,7 @@ pub const GlobalLimiter = struct {
         while (true) {
             switch (self.allow()) {
                 .allowed => return,
-                .denied => |d| std.time.sleep(@intCast(d.retry_after_ns)),
+                .denied => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
             }
         }
     }
@@ -208,7 +212,7 @@ pub fn RateLimiter(comptime K: type) type {
                 const outcome = try self.allow(key);
                 switch (outcome) {
                     .allowed => return,
-                    .denied => |d| std.time.sleep(@intCast(d.retry_after_ns)),
+                    .denied => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
                 }
             }
         }
@@ -598,6 +602,91 @@ test "RateLimiter: retry_after_ns decreases as time advances" {
     try std.testing.expect(wait2 < wait1);
 }
 
+test "RateLimiter: wait blocks and succeeds" {
+    var sys = SystemClock{};
+    var lim = try RateLimiter(u32).init(.{
+        .allocator = std.testing.allocator,
+        .rate = 10,
+        .per = .second, // 100ms per slot
+        .clock = sys.clock(),
+    });
+    defer lim.deinit();
+
+    // Exhaust key 42
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = try lim.allow(42);
+    }
+
+    const start = std.time.milliTimestamp();
+    try lim.wait(42);
+    const end = std.time.milliTimestamp();
+
+    try std.testing.expect(end - start >= 50);
+}
+
+test "RateLimiter: stress — 10k unique keys" {
+    var mc = ManualClock{};
+    var lim = try RateLimiter(u32).init(.{
+        .allocator = std.testing.allocator,
+        .rate = 1,
+        .per = .hour,
+        .clock = mc.clock(),
+    });
+    defer lim.deinit();
+
+    var i: u32 = 0;
+    while (i < 10_000) : (i += 1) {
+        try std.testing.expect((try lim.allow(i)).is_allowed());
+    }
+    try std.testing.expectEqual(@as(usize, 10_000), lim.key_count());
+
+    // Second pass — all must be denied (rate is 1/hour)
+    i = 0;
+    while (i < 10_000) : (i += 1) {
+        try std.testing.expect(!(try lim.allow(i)).is_allowed());
+    }
+}
+
+test "GlobalLimiter: concurrent contention" {
+    const num_threads = 4;
+    const total_slots = 1000;
+
+    var sys = SystemClock{};
+    var lim = try GlobalLimiter.init(.{
+        .rate = total_slots,
+        .per = .hour,
+        .burst = total_slots - 1,
+        .clock = sys.clock(),
+    });
+
+    const Ctx = struct {
+        limiter: *GlobalLimiter,
+        allowed: std.atomic.Value(usize),
+
+        fn run(ctx: *@This()) void {
+            while (true) {
+                if (ctx.limiter.allow().is_allowed()) {
+                    _ = ctx.allowed.fetchAdd(1, .monotonic);
+                } else break;
+            }
+        }
+    };
+
+    var ctx = Ctx{
+        .limiter = &lim,
+        .allowed = std.atomic.Value(usize).init(0),
+    };
+
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+    }
+    for (&threads) |*t| t.join();
+
+    try std.testing.expectEqual(@as(usize, total_slots), ctx.allowed.load(.monotonic));
+}
+
 test "GlobalLimiter: basic allow and deny" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
@@ -629,6 +718,29 @@ test "GlobalLimiter: reset restores capacity" {
     try std.testing.expectEqual(false, lim.allow().is_allowed());
     lim.reset();
     try std.testing.expectEqual(true, lim.allow().is_allowed());
+}
+
+test "GlobalLimiter: wait blocks and eventually succeeds" {
+    var sys = SystemClock{};
+    var lim = try GlobalLimiter.init(.{
+        .rate = 10,
+        .per = .second, // 100ms per slot
+        .burst = 0,
+        .clock = sys.clock(),
+    });
+
+    // Exhaust immediately
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = lim.allow();
+    }
+    try std.testing.expectEqual(false, lim.allow().is_allowed());
+
+    const start = std.time.milliTimestamp();
+    lim.wait(); // should block for roughly 100ms
+    const end = std.time.milliTimestamp();
+
+    try std.testing.expect(end - start >= 50); // allow some slack
 }
 
 test "GlobalLimiter: allow_n batch" {
