@@ -1,17 +1,8 @@
 # zimit
 
-A GCRA-based rate limiter for Zig 0.15+.
+A GCRA-based rate limiter for Zig 0.15+ with a token-bucket-like API.
 
-Exposes a token-bucket-flavored API while running a Generic Cell Rate Algorithm
-(GCRA) engine underneath — single `i64` TAT per key, no floats, atomic-friendly.
-
-## Features
-
-- Pure-function GCRA core — no allocations, no global state, trivially testable
-- Multi-key `HashMap`-backed limiter for strings, integers, or any hashable type
-- Manual clock injection — deterministic tests without sleeping
-- Atomic batch requests via `allow_n`
-- `retry_after_ns` / `retry_after_ms_ceil` on every denial — caller decides how to wait
+Internally uses a single `i64` TAT per key. No floats, deterministic, and allocation-efficient.
 
 ## Installation
 
@@ -21,7 +12,7 @@ Add to your `build.zig.zon`:
 .dependencies = .{
     .zimit = .{
         .url = "https://github.com/minhqdao/zimit/archive/0.1.0.tar.gz",
-        .hash = "...", // paste the hash zig tells you on first build
+        .hash = "...", // run `zig build` once and paste the reported hash
     },
 },
 ```
@@ -33,23 +24,39 @@ const zimit = b.dependency("zimit", .{ .target = target, .optimize = optimize })
 exe.root_module.addImport("zimit", zimit.module("zimit"));
 ```
 
-## Usage
+## Example
 
 ```zig
+const std = @import("std");
 const zimit = @import("zimit");
 
-var sys_clock = zimit.SystemClock{};
+var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+defer _ = gpa.deinit();
+
+var sys = zimit.SystemClock{};
 var limiter = try zimit.RateLimiter([]const u8).init(.{
-    .allocator = allocator,
+    .allocator = gpa.allocator(),
     .rate      = 100,
     .per       = .second,
     .burst     = 20,
-    .clock     = sys_clock.clock(),
+    .clock     = sys.clock(),
 });
 defer limiter.deinit();
 
-switch (try limiter.allow("192.168.1.1")) {
-    .allowed => handleRequest(),
-    .denied  => |d| sendTooManyRequests(d.retry_after_ms_ceil()),
+switch (try limiter.allow("user")) {
+    .allowed => handle(),
+    .denied  => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
 }
 ```
+
+## Notes
+
+- **Per-key limiting:** Each key is tracked independently (e.g. per user ID or IP address).
+- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput).
+- **String keys are copied:** you can pass temporary `[]const u8` safely.
+- **Blocking vs non-blocking:**
+  - `allow()` → immediate decision
+  - `wait()` → blocks until allowed
+- **Clocks:**
+  - `SystemClock` → production
+  - `ManualClock` → deterministic tests
