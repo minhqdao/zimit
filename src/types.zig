@@ -165,6 +165,33 @@ test "Limit.per_minute: 60 req/min → 1s emission interval" {
     try std.testing.expectEqual(std.time.ns_per_s, l.emission_interval());
 }
 
+test "Limit.per_hour: 3600 req/h → 1s emission interval" {
+    const l = Limit.per_hour(3600);
+    try std.testing.expectEqual(std.time.ns_per_s, l.emission_interval());
+}
+
+test "Limit.per_hour: 1 req/h → 1 hour emission interval" {
+    const l = Limit.per_hour(1);
+    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), l.emission_interval());
+}
+
+test "Limit.emission_interval: large count does not overflow" {
+    // maxInt(u32) = 4_294_967_295
+    // period_ns = 1_000_000_000 (1s)
+    // interval = 1_000_000_000 / 4_294_967_295 = 0 (integer truncation)
+    const l = Limit.per_second(std.math.maxInt(u32));
+    const interval = l.emission_interval();
+    try std.testing.expect(interval >= 0);
+}
+
+test "Limit.burst_offset: burst=maxInt(u32) with large interval does not panic" {
+    // 1 req/s → interval = 1_000_000_000
+    // burst = 1 → offset = 1_000_000_000
+    const l = Limit.per_second(1);
+    const offset = l.burst_offset(1);
+    try std.testing.expectEqual(std.time.ns_per_s, offset);
+}
+
 test "Decision.is_allowed" {
     const allowed = Decision{ .allowed = .{ .new_tat = 42 } };
     const denied = Decision{ .denied = .{ .retry_after_ns = 1000 } };
@@ -239,4 +266,30 @@ test "ManualClock: Clock interface forwards correctly" {
     const clk = mc.clock();
     mc.set(42_000);
     try std.testing.expectEqual(@as(i64, 42_000), clk.now());
+}
+
+test "ManualClock: many ticks accumulate correctly" {
+    var c = ManualClock{};
+    var i: usize = 0;
+    while (i < 1000) : (i += 1) {
+        c.tick(1_000_000); // 1ms each
+    }
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), c.clock().now());
+}
+
+test "ManualClock: set then tick combines correctly" {
+    var c = ManualClock{};
+    c.set(5_000_000_000); // 5s
+    c.tick(2_000_000_000); // +2s
+    try std.testing.expectEqual(@as(i64, 7_000_000_000), c.clock().now());
+}
+
+test "Decision: allowed is_allowed returns true" {
+    const d = Decision{ .allowed = .{ .new_tat = 0 } };
+    try std.testing.expect(d.is_allowed());
+}
+
+test "Decision: denied is_allowed returns false" {
+    const d = Decision{ .denied = .{ .retry_after_ns = 100 } };
+    try std.testing.expect(!d.is_allowed());
 }
