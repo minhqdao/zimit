@@ -91,13 +91,24 @@ pub const Clock = struct {
 
 /// Reads the real system monotonic clock.
 pub const SystemClock = struct {
+    io: std.Io,
+
+    /// Initialise a system clock with the provided I/O implementation.
+    /// In production, use `init.io` from `main(init: std.process.Init)`.
+    /// In tests, use `std.testing.io`.
+    pub fn init(io: std.Io) SystemClock {
+        return .{ .io = io };
+    }
+
     /// Returns a generic `Clock` interface backed by this SystemClock.
     pub fn clock(self: *SystemClock) Clock {
         return .{ .ptr = self, .now_fn = now_impl };
     }
 
-    fn now_impl(_: *anyopaque) i64 {
-        return @intCast(std.time.nanoTimestamp());
+    fn now_impl(ptr: *anyopaque) i64 {
+        const self: *SystemClock = @ptrCast(@alignCast(ptr));
+        const ts = std.Io.Timestamp.now(self.io, .real);
+        return @intCast(ts.toNanoseconds());
     }
 };
 
@@ -207,7 +218,7 @@ test "Decision.retry_after_ns" {
 }
 
 test "SystemClock: monotonic non-decreasing without sleep" {
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     const clk = sys.clock();
 
     var prev = clk.now();
@@ -221,7 +232,7 @@ test "SystemClock: monotonic non-decreasing without sleep" {
 }
 
 test "SystemClock: returns positive i64" {
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     const clk = sys.clock();
 
     const t = clk.now();
@@ -229,7 +240,7 @@ test "SystemClock: returns positive i64" {
 }
 
 test "SystemClock: multiple calls are non-decreasing" {
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     const clk = sys.clock();
 
     var prev = clk.now();

@@ -1,6 +1,6 @@
 # zimit
 
-A GCRA-based rate limiter for Zig 0.15+ with a token-bucket-like API.
+A GCRA-based rate limiter for Zig 0.16.0+ with a token-bucket-like API.
 
 Internally uses a single `i64` TAT per key. No floats, deterministic, and allocation-efficient.
 
@@ -30,22 +30,29 @@ exe.root_module.addImport("zimit", zimit.module("zimit"));
 const std = @import("std");
 const zimit = @import("zimit");
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-defer _ = gpa.deinit();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
+    const io = init.io;
 
-var sys = zimit.SystemClock{};
-var limiter = try zimit.RateLimiter([]const u8).init(.{
-    .allocator = gpa.allocator(),
-    .rate      = 100,
-    .per       = .second,
-    .burst     = 20,
-    .clock     = sys.clock(),
-});
-defer limiter.deinit();
+    var sys = zimit.SystemClock.init(io);
 
-switch (try limiter.allow("user")) {
-    .allowed => handle(),
-    .denied  => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
+    var limiter = try zimit.RateLimiter([]const u8).init(.{
+        .allocator = gpa,
+        .rate = 5,
+        .per = .second,
+        .burst = 2,
+        .clock = sys.clock(),
+    });
+    defer limiter.deinit();
+
+    const key = "127.0.0.1";
+
+    switch (try limiter.allow(key)) {
+        .allowed => std.debug.print("Allowed!\n", .{}),
+        .denied => |d| {
+            std.debug.print("Denied, retrying in {d}ms...\n", .{d.retry_after_ms_ceil()});
+        },
+    }
 }
 ```
 
@@ -56,7 +63,7 @@ switch (try limiter.allow("user")) {
 - **String keys are copied:** you can pass temporary `[]const u8` safely.
 - **Blocking vs non-blocking:**
   - `allow()` → immediate decision
-  - `wait()` → blocks until allowed
+  - `wait(io, key)` → blocks until allowed (uses `std.Io.sleep`)
 - **Clocks:**
-  - `SystemClock` → production
+  - `SystemClock` → production (requires `std.Io`)
   - `ManualClock` → deterministic tests
