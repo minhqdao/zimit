@@ -661,6 +661,20 @@ test "RateLimiter: init rejects zero rate" {
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
+test "RateLimiter: init rejects rate > 1 req/ns" {
+    var mc = ManualClock{};
+    // per = .second (= 1_000_000_000 ns)
+    // rate = 2_000_000_000 > 1_000_000_000
+    const result = StringRateLimiter.init(.{
+        .allocator = std.testing.allocator,
+        .rate = 2_000_000_000,
+        .per = .second,
+        .burst = 0,
+        .clock = mc.clock(),
+    });
+    try std.testing.expectError(error.RateExceedsRes, result);
+}
+
 test "RateLimiter: per-hour config with burst and time advance" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);

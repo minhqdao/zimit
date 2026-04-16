@@ -143,6 +143,8 @@ pub const ManualClock = struct {
 pub const ZimitError = error{
     /// count or period_ns is zero — would produce a zero emission interval.
     InvalidLimit,
+    /// count > period_ns — rate is > 1 req/ns, which exceeds resolution.
+    RateExceedsRes,
     /// Out of memory when inserting a new key into the store.
     OutOfMemory,
 };
