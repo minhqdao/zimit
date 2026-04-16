@@ -206,8 +206,7 @@ pub fn RateLimiter(comptime K: type) type {
         /// Block the calling thread until `key` is allowed.
         ///
         /// This is the simple synchronous wait. For async contexts, use
-        /// `allow` and handle the `retry_after_ns` yourself — this is the
-        /// design seam Gemini correctly identified for the 0.16.0 upgrade.
+        /// `allow` and handle the `retry_after_ns` yourself.
         pub fn wait(self: *Self, io: std.Io, key: K) !void {
             while (true) {
                 const outcome = try self.allow(key);
