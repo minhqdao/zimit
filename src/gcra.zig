@@ -71,6 +71,7 @@ pub fn Limiter(comptime K: type) type {
             clock: Clock,
         ) ZimitError!Self {
             if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+            if (limit.count > limit.period_ns) return error.RateExceedsRes;
             const interval = limit.emission_interval();
             return .{
                 .allocator = allocator,
@@ -203,6 +204,7 @@ pub const AtomicLimiter = struct {
     ///   clock  Time source.
     pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
         if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+        if (limit.count > limit.period_ns) return error.RateExceedsRes;
 
         const interval = limit.emission_interval();
 
@@ -514,6 +516,13 @@ test "Limiter: init rejects zero count" {
     const bad = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
     const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
     try std.testing.expectError(error.InvalidLimit, result);
+}
+
+test "Limiter: init rejects rate > 1 req/ns" {
+    var mc = types.ManualClock{};
+    const bad = Limit{ .count = 2, .period_ns = 1 };
+    const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
+    try std.testing.expectError(error.RateExceedsRes, result);
 }
 
 test "Limiter: init rejects non-positive period" {
@@ -1211,6 +1220,15 @@ test "AtomicLimiter: init rejects zero count" {
     const bad = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
     try std.testing.expectError(
         error.InvalidLimit,
+        AtomicLimiter.init(bad, 0, mc.clock()),
+    );
+}
+
+test "AtomicLimiter: init rejects rate > 1 req/ns" {
+    var mc = types.ManualClock{};
+    const bad = Limit{ .count = 2, .period_ns = 1 };
+    try std.testing.expectError(
+        error.RateExceedsRes,
         AtomicLimiter.init(bad, 0, mc.clock()),
     );
 }
