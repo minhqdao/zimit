@@ -22,6 +22,23 @@ Then in `build.zig`:
 ```zig
 const zimit = b.dependency("zimit", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("zimit", zimit.module("zimit"));
+
+const zimit_dep = b.dependency("zimit", .{
+    .target = target,
+    .optimize = optimize,
+});
+
+const exe = b.addExecutable(.{
+    .name = "yourapp",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zimit", .module = zimit_dep.module("zimit") },
+        },
+    }),
+});
 ```
 
 ## Example
