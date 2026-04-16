@@ -1,3 +1,4 @@
-.zig-cache/
-zig-out/
-docgen-tmp/
+.zig-cache
+zig-out
+zig-pkg
+docgen-tmp
