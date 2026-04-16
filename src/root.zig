@@ -5,10 +5,11 @@
 //!     const std = @import("std");
 //!     const zimit = @import("zimit");
 //!
+//! pub fn main(init: std.process.Init) !void {
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 //!     defer _ = gpa.deinit();
 //!
-//!     var sys_clock = zimit.SystemClock{};
+//!     var sys_clock = zimit.SystemClock.init(init.io);
 //!     var limiter = try zimit.RateLimiter([]const u8).init(.{
 //!         .allocator  = gpa.allocator(),
 //!         .rate       = 100,          // 100 requests …
@@ -137,11 +138,11 @@ pub const GlobalLimiter = struct {
     /// Block the calling thread until allowed.
     /// Same design seam as `RateLimiter.wait` — replace with fiber suspension
     /// once Zig 0.16.0 async lands.
-    pub fn wait(self: *GlobalLimiter) void {
+    pub fn wait(self: *GlobalLimiter, io: std.Io) !void {
         while (true) {
             switch (self.allow()) {
                 .allowed => return,
-                .denied => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
+                .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
             }
         }
     }
@@ -207,12 +208,12 @@ pub fn RateLimiter(comptime K: type) type {
         /// This is the simple synchronous wait. For async contexts, use
         /// `allow` and handle the `retry_after_ns` yourself — this is the
         /// design seam Gemini correctly identified for the 0.16.0 upgrade.
-        pub fn wait(self: *Self, key: K) ZimitError!void {
+        pub fn wait(self: *Self, io: std.Io, key: K) !void {
             while (true) {
                 const outcome = try self.allow(key);
                 switch (outcome) {
                     .allowed => return,
-                    .denied => |d| std.Thread.sleep(@intCast(d.retry_after_ns)),
+                    .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
                 }
             }
         }
@@ -603,7 +604,7 @@ test "RateLimiter: retry_after_ns decreases as time advances" {
 }
 
 test "RateLimiter: wait blocks and succeeds" {
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     var lim = try RateLimiter(u32).init(.{
         .allocator = std.testing.allocator,
         .rate = 10,
@@ -618,9 +619,9 @@ test "RateLimiter: wait blocks and succeeds" {
         _ = try lim.allow(42);
     }
 
-    const start = std.time.milliTimestamp();
-    try lim.wait(42);
-    const end = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    try lim.wait(std.testing.io, 42);
+    const end = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
 
     try std.testing.expect(end - start >= 50);
 }
@@ -733,7 +734,7 @@ test "GlobalLimiter: concurrent contention" {
     const num_threads = 4;
     const total_slots = 1000;
 
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     var lim = try GlobalLimiter.init(.{
         .rate = total_slots,
         .per = .hour,
@@ -802,7 +803,7 @@ test "GlobalLimiter: reset restores capacity" {
 }
 
 test "GlobalLimiter: wait blocks and eventually succeeds" {
-    var sys = SystemClock{};
+    var sys = SystemClock.init(std.testing.io);
     var lim = try GlobalLimiter.init(.{
         .rate = 10,
         .per = .second, // 100ms per slot
@@ -817,9 +818,9 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     }
     try std.testing.expectEqual(false, lim.allow().is_allowed());
 
-    const start = std.time.milliTimestamp();
-    lim.wait(); // should block for roughly 100ms
-    const end = std.time.milliTimestamp();
+    const start = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    try lim.wait(std.testing.io); // should block for roughly 100ms
+    const end = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
 
     try std.testing.expect(end - start >= 50); // allow some slack
 }

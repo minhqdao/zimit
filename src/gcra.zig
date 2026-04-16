@@ -1407,7 +1407,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
     const num_threads = 8;
     const requests_per_thread = 200;
 
-    var sys = types.SystemClock{};
+    var sys = types.SystemClock.init(std.testing.io);
     var lim = try AtomicLimiter.init(
         Limit.per_second(1000),
         0,
@@ -1433,7 +1433,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
         .allowed = std.atomic.Value(usize).init(0),
     };
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds();
 
     var threads: [num_threads]std.Thread = undefined;
     for (&threads) |*t| {
@@ -1441,7 +1441,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
     }
     for (&threads) |*t| t.join();
 
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+    const elapsed_ns = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds() - start_ns;
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
 
     const total_allowed = ctx.allowed.load(.monotonic);
@@ -1461,7 +1461,7 @@ test "AtomicLimiter: concurrent allows — no lost updates under contention" {
     const num_threads = 8;
     const requests_per_thread = 20; // 160 total attempts for 50 slots
 
-    var sys = types.SystemClock{};
+    var sys = types.SystemClock.init(std.testing.io);
     // Large period so slots don't replenish during the test
     var lim = try AtomicLimiter.init(
         Limit{ .count = total_slots, .period_ns = std.time.ns_per_s },
