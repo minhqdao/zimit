@@ -1,0 +1,12 @@
+.{
+    .name = .rate_limiter_example,
+    .version = "0.0.0",
+    .fingerprint = 0xb40d2b853aaf77d5,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zimit = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{""},
+}

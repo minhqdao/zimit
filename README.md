@@ -2,8 +2,6 @@
 
 A GCRA-based rate limiter for Zig 0.16.0+ with a token-bucket-like API.
 
-Internally uses a single `i64` TAT per key. No floats, deterministic, and allocation-efficient.
-
 ## Installation
 
 Add to your `build.zig.zon`:
@@ -41,7 +39,7 @@ const exe = b.addExecutable(.{
 });
 ```
 
-## Example
+## Usage
 
 ```zig
 const std = @import("std");
@@ -64,23 +62,27 @@ pub fn main(init: std.process.Init) !void {
 
     const key = "127.0.0.1";
 
-    switch (try limiter.allow(key)) {
-        .allowed => std.debug.print("Allowed!\n", .{}),
-        .denied => |d| {
-            std.debug.print("Denied, retrying in {d}ms...\n", .{d.retry_after_ms_ceil()});
-        },
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        switch (try limiter.allow(key)) {
+            .allowed => std.debug.print("allowed\n", .{}),
+            .denied => |d| {
+                std.debug.print("denied, time until allowed: {d}ms\n", .{d.retry_after_ms_ceil()});
+            },
+        }
     }
 }
+
 ```
+See [examples](examples) for more.
 
 ## Notes
 
-- **Per-key limiting:** Each key is tracked independently (e.g. per user ID or IP address).
+- **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address).
 - **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput).
-- **String keys are copied:** you can pass temporary `[]const u8` safely.
 - **Blocking vs non-blocking:**
-  - `allow()` → immediate decision
-  - `wait(io, key)` → blocks until allowed (uses `std.Io.sleep`)
+  - `allow()` → Immediate decision
+  - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
 - **Clocks:**
-  - `SystemClock` → production (requires `std.Io`)
-  - `ManualClock` → deterministic tests
+  - `SystemClock` → Production (requires `std.process.Init.io`)
+  - `ManualClock` → Deterministic tests

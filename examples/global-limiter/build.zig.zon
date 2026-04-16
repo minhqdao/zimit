@@ -1,0 +1,12 @@
+.{
+    .name = .global_limiter_example,
+    .version = "0.0.0",
+    .fingerprint = 0x3ef5794b9909609a,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zimit = .{
+            .path = "../..",
+        },
+    },
+    .paths = .{""},
+}
