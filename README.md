@@ -9,8 +9,8 @@ Add to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .zimit = .{
-        .url = "https://github.com/minhqdao/zimit/archive/0.1.0.tar.gz",
-        .hash = "zimit-0.1.0-PtOTgxF8AQBT7d_YrB1ObB4p5-Gpv0qDYmJ1siYn2iF0",
+        .url = "https://github.com/minhqdao/zimit/archive/0.2.0.tar.gz",
+        .hash = "...",
     },
 },
 ```
