@@ -18,9 +18,6 @@ Add to your `build.zig.zon`:
 Then in `build.zig`:
 
 ```zig
-const zimit = b.dependency("zimit", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("zimit", zimit.module("zimit"));
-
 const zimit_dep = b.dependency("zimit", .{
     .target = target,
     .optimize = optimize,
