@@ -7,11 +7,6 @@ pub fn build(b: *std.Build) void {
     // ── Library module (what dependents import) ───────────────────────────────
     //
     // This is the only thing a consumer of zimit actually needs.
-    // Their build.zig does:
-    //
-    //     const zimit = b.dependency("zimit", .{ .target = target, .optimize = optimize });
-    //     exe.root_module.addImport("zimit", zimit.module("zimit"));
-    //
     const zimit_mod = b.addModule("zimit", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -49,13 +44,39 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        // Each test binary can import "zimit" the same way a real consumer
-        // would — no special test-only import paths needed.
         t.root_module.addImport("zimit", zimit_mod);
 
         const run_t = b.addRunArtifact(t);
         run_t.has_side_effects = true; // always re-run, never cache
         test_step.dependOn(&run_t.step);
+    }
+
+    // ── Examples ─────────────────────────────────────────────────────────────
+    //
+    // Run all examples with `zig build examples`.
+    const examples_step = b.step("examples", "Build and run all examples");
+
+    const example_names = [_][]const u8{
+        "global-limiter",
+        "global-limiter-wait",
+        "rate-limiter",
+    };
+
+    for (example_names) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("examples/{s}/src/main.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zimit", .module = zimit_mod },
+                },
+            }),
+        });
+
+        const run = b.addRunArtifact(exe);
+        examples_step.dependOn(&run.step);
     }
 
     // ── Docs ──────────────────────────────────────────────────────────────────
