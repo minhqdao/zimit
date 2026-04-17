@@ -51,7 +51,6 @@ pub fn check(
 /// keys are hashed but not copied; callers must ensure key lifetime covers the call.
 ///
 /// Thread safety: none. Wrap with a mutex if shared across threads.
-/// (Step 5 will add an atomic single-key variant for lock-free hot paths.)
 pub fn Limiter(comptime K: type) type {
     return struct {
         const Self = @This();

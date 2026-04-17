@@ -160,6 +160,8 @@ pub const GlobalLimiter = struct {
 /// `K` is the key type — typically `[]const u8` (IP, username) or an integer
 /// (user ID, session ID). All keys are isolated; one key's limit does not
 /// affect another's.
+///
+/// Thread safety: none. Wrap with a mutex if shared across threads.
 pub fn RateLimiter(comptime K: type) type {
     return struct {
         const Self = @This();
