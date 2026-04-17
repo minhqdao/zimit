@@ -77,18 +77,6 @@ pub const Decision = union(enum) {
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
 
-/// Anything that can tell us the current time in nanoseconds.
-/// Use `SystemClock` in production. Pass a `ManualClock` in tests.
-pub const Clock = struct {
-    ptr: *anyopaque,
-    now_fn: *const fn (ptr: *anyopaque) i64,
-
-    /// Returns the current time in nanoseconds.
-    pub fn now(self: Clock) i64 {
-        return self.now_fn(self.ptr);
-    }
-};
-
 /// Reads the real system monotonic clock.
 pub const SystemClock = struct {
     io: std.Io,
@@ -100,13 +88,8 @@ pub const SystemClock = struct {
         return .{ .io = io };
     }
 
-    /// Returns a generic `Clock` interface backed by this SystemClock.
-    pub fn clock(self: *SystemClock) Clock {
-        return .{ .ptr = self, .now_fn = now_impl };
-    }
-
-    fn now_impl(ptr: *anyopaque) i64 {
-        const self: *SystemClock = @ptrCast(@alignCast(ptr));
+    /// Returns the current time in nanoseconds.
+    pub fn now(self: SystemClock) i64 {
         const ts = std.Io.Timestamp.now(self.io, .real);
         return @intCast(ts.toNanoseconds());
     }
@@ -117,9 +100,9 @@ pub const SystemClock = struct {
 pub const ManualClock = struct {
     time_ns: i64 = 0,
 
-    /// Returns a generic `Clock` interface backed by this ManualClock.
-    pub fn clock(self: *ManualClock) Clock {
-        return .{ .ptr = self, .now_fn = now_impl };
+    /// Returns the current time in nanoseconds.
+    pub fn now(self: ManualClock) i64 {
+        return self.time_ns;
     }
 
     /// Sets the clock to an absolute time in nanoseconds.
@@ -130,11 +113,6 @@ pub const ManualClock = struct {
     /// Advances the clock by a duration in nanoseconds.
     pub fn tick(self: *ManualClock, ns: i64) void {
         self.time_ns += ns;
-    }
-
-    fn now_impl(ptr: *anyopaque) i64 {
-        const self: *ManualClock = @ptrCast(@alignCast(ptr));
-        return self.time_ns;
     }
 };
 
@@ -220,65 +198,61 @@ test "Decision.retry_after_ns" {
 }
 
 test "SystemClock: monotonic non-decreasing without sleep" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
+    const sys = SystemClock.init(std.testing.io);
 
-    var prev = clk.now();
+    var prev = sys.now();
 
     var i: usize = 0;
     while (i < 10_000) : (i += 1) {
-        const now = clk.now();
+        const now = sys.now();
         try std.testing.expect(now >= prev);
         prev = now;
     }
 }
 
 test "SystemClock: returns positive i64" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
+    const sys = SystemClock.init(std.testing.io);
 
-    const t = clk.now();
+    const t = sys.now();
     try std.testing.expect(t > 0);
 }
 
 test "SystemClock: multiple calls are non-decreasing" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
+    const sys = SystemClock.init(std.testing.io);
 
-    var prev = clk.now();
+    var prev = sys.now();
 
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        const now = clk.now();
+        const now = sys.now();
         try std.testing.expect(now >= prev);
         prev = now;
     }
 }
 
 test "ManualClock: starts at zero" {
-    var c = ManualClock{};
-    try std.testing.expectEqual(@as(i64, 0), c.clock().now());
+    const c = ManualClock{};
+    try std.testing.expectEqual(@as(i64, 0), c.now());
 }
 
 test "ManualClock: tick advances time" {
     var c = ManualClock{};
     c.tick(1_000_000);
     c.tick(500_000);
-    try std.testing.expectEqual(@as(i64, 1_500_000), c.clock().now());
+    try std.testing.expectEqual(@as(i64, 1_500_000), c.now());
 }
 
 test "ManualClock: set jumps to absolute time" {
     var c = ManualClock{};
     c.tick(9999);
     c.set(1_000_000_000);
-    try std.testing.expectEqual(@as(i64, 1_000_000_000), c.clock().now());
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), c.now());
 }
 
-test "ManualClock: Clock interface forwards correctly" {
+test "ManualClock: now returns current time_ns" {
     var mc = ManualClock{};
-    const clk = mc.clock();
     mc.set(42_000);
-    try std.testing.expectEqual(@as(i64, 42_000), clk.now());
+    try std.testing.expectEqual(@as(i64, 42_000), mc.now());
 }
 
 test "ManualClock: many ticks accumulate correctly" {
@@ -287,14 +261,14 @@ test "ManualClock: many ticks accumulate correctly" {
     while (i < 1000) : (i += 1) {
         c.tick(1_000_000); // 1ms each
     }
-    try std.testing.expectEqual(@as(i64, 1_000_000_000), c.clock().now());
+    try std.testing.expectEqual(@as(i64, 1_000_000_000), c.now());
 }
 
 test "ManualClock: set then tick combines correctly" {
     var c = ManualClock{};
     c.set(5_000_000_000); // 5s
     c.tick(2_000_000_000); // +2s
-    try std.testing.expectEqual(@as(i64, 7_000_000_000), c.clock().now());
+    try std.testing.expectEqual(@as(i64, 7_000_000_000), c.now());
 }
 
 test "Decision: allowed is_allowed returns true" {

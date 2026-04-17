@@ -9,13 +9,13 @@
 //!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 //!     defer _ = gpa.deinit();
 //!
-//!     var sys_clock = zimit.SystemClock.init(init.io);
-//!     var limiter = try zimit.RateLimiter([]const u8).init(.{
+//!     const sys_clock = zimit.SystemClock.init(init.io);
+//!     var limiter = try zimit.RateLimiter([]const u8, zimit.SystemClock).init(.{
 //!         .allocator  = gpa.allocator(),
 //!         .rate       = 100,          // 100 requests …
 //!         .per        = .second,      // … per second
 //!         .burst      = 20,           // allow up to 20 extra in a burst
-//!         .clock      = sys_clock.clock(),
+//!         .clock      = sys_clock,
 //!     });
 //!     defer limiter.deinit();
 //!
@@ -32,7 +32,6 @@ const types = @import("types.zig");
 
 pub const Limit = types.Limit;
 pub const Decision = types.Decision;
-pub const Clock = types.Clock;
 pub const SystemClock = types.SystemClock;
 pub const ManualClock = types.ManualClock;
 pub const ZimitError = types.ZimitError;
@@ -58,7 +57,7 @@ pub const Period = enum {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for `RateLimiter.init`.
-pub fn RateLimiterConfig(comptime K: type) type {
+pub fn RateLimiterConfig(comptime K: type, comptime ClockType: type) type {
     _ = K; // keeps the type parameter meaningful for future fields
     return struct {
         allocator: std.mem.Allocator,
@@ -70,7 +69,7 @@ pub fn RateLimiterConfig(comptime K: type) type {
         /// 0 means no burst — every request must wait its full slot.
         burst: u32 = 0,
         /// Time source. Use `SystemClock` in production, `ManualClock` in tests.
-        clock: Clock,
+        clock: ClockType,
     };
 }
 
@@ -105,53 +104,58 @@ pub const Outcome = union(enum) {
 /// threads — for example, "this service may make at most N outbound calls/s".
 ///
 /// For per-key limits use `RateLimiter(K)`.
-pub const GlobalLimiter = struct {
-    inner: gcra.AtomicLimiter,
+pub fn GlobalLimiter(comptime ClockType: type) type {
+    return struct {
+        const Self = @This();
+        const Inner = gcra.AtomicLimiter(ClockType);
 
-    /// Initialise a global limiter.
-    pub fn init(cfg: struct {
-        rate: u32,
-        per: Period,
-        burst: u32 = 0,
-        clock: Clock,
-    }) ZimitError!GlobalLimiter {
-        const limit = Limit{
-            .count = cfg.rate,
-            .period_ns = cfg.per.to_ns(),
-        };
-        return .{ .inner = try gcra.AtomicLimiter.init(limit, cfg.burst, cfg.clock) };
-    }
+        inner: Inner,
 
-    /// Convenience for `allow_n(1)`.
-    pub fn allow(self: *GlobalLimiter) Outcome {
-        return self.allow_n(1);
-    }
+        /// Initialise a global limiter.
+        pub fn init(cfg: struct {
+            rate: u32,
+            per: Period,
+            burst: u32 = 0,
+            clock: ClockType,
+        }) ZimitError!Self {
+            const limit = Limit{
+                .count = cfg.rate,
+                .period_ns = cfg.per.to_ns(),
+            };
+            return .{ .inner = try Inner.init(limit, cfg.burst, cfg.clock) };
+        }
 
-    /// Atomically consume `n` slots.
-    pub fn allow_n(self: *GlobalLimiter, n: u32) Outcome {
-        return switch (self.inner.allow_n(n)) {
-            .allowed => .allowed,
-            .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
-        };
-    }
+        /// Convenience for `allow_n(1)`.
+        pub fn allow(self: *Self) Outcome {
+            return self.allow_n(1);
+        }
 
-    /// Block the calling thread until allowed.
-    /// Same design seam as `RateLimiter.wait` — replace with fiber suspension
-    /// once Zig 0.16.0 async lands.
-    pub fn wait(self: *GlobalLimiter, io: std.Io) !void {
-        while (true) {
-            switch (self.allow()) {
-                .allowed => return,
-                .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
+        /// Atomically consume `n` slots.
+        pub fn allow_n(self: *Self, n: u32) Outcome {
+            return switch (self.inner.allow_n(n)) {
+                .allowed => .allowed,
+                .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
+            };
+        }
+
+        /// Block the calling thread until allowed.
+        /// Same design seam as `RateLimiter.wait` — replace with fiber suspension
+        /// once Zig 0.16.0 async lands.
+        pub fn wait(self: *Self, io: std.Io) !void {
+            while (true) {
+                switch (self.allow()) {
+                    .allowed => return,
+                    .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
+                }
             }
         }
-    }
 
-    /// Resets the limiter to its initial state.
-    pub fn reset(self: *GlobalLimiter) void {
-        self.inner.reset();
-    }
-};
+        /// Resets the limiter to its initial state.
+        pub fn reset(self: *Self) void {
+            self.inner.reset();
+        }
+    };
+}
 
 // ── RateLimiter ───────────────────────────────────────────────────────────────
 
@@ -162,15 +166,15 @@ pub const GlobalLimiter = struct {
 /// affect another's.
 ///
 /// Thread safety: none. Wrap with a mutex if shared across threads.
-pub fn RateLimiter(comptime K: type) type {
+pub fn RateLimiter(comptime K: type, comptime ClockType: type) type {
     return struct {
         const Self = @This();
-        const Inner = gcra.Limiter(K);
+        const Inner = gcra.Limiter(K, ClockType);
 
         inner: Inner,
 
         /// Create a new limiter from a `RateLimiterConfig`.
-        pub fn init(cfg: RateLimiterConfig(K)) ZimitError!Self {
+        pub fn init(cfg: RateLimiterConfig(K, ClockType)) ZimitError!Self {
             const limit = Limit{
                 .count = cfg.rate,
                 .period_ns = cfg.per.to_ns(),
@@ -233,19 +237,21 @@ pub fn RateLimiter(comptime K: type) type {
 }
 
 /// Convenience alias — the overwhelmingly common case.
-pub const StringRateLimiter = RateLimiter([]const u8);
+pub fn StringRateLimiter(comptime ClockType: type) type {
+    return RateLimiter([]const u8, ClockType);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn makeLimiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRateLimiter {
-    return StringRateLimiter.init(.{
+fn makeLimiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRateLimiter(*ManualClock) {
+    return StringRateLimiter(*ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = rate,
         .per = per,
         .burst = burst,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 }
 
@@ -436,12 +442,12 @@ test "RateLimiter: per minute config" {
 test "RateLimiter: integer key type (u64)" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try RateLimiter(u64).init(.{
+    var lim = try RateLimiter(u64, ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 5,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
     defer lim.deinit();
 
@@ -605,12 +611,12 @@ test "RateLimiter: retry_after_ns decreases as time advances" {
 }
 
 test "RateLimiter: wait blocks and succeeds" {
-    var sys = SystemClock.init(std.testing.io);
-    var lim = try RateLimiter(u32).init(.{
+    const sys = SystemClock.init(std.testing.io);
+    var lim = try RateLimiter(u32, SystemClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 10,
         .per = .second, // 100ms per slot
-        .clock = sys.clock(),
+        .clock = sys,
     });
     defer lim.deinit();
 
@@ -628,12 +634,12 @@ test "RateLimiter: wait blocks and succeeds" {
 }
 
 test "RateLimiter: stress — 10k unique keys" {
-    var mc = ManualClock{};
-    var lim = try RateLimiter(u32).init(.{
+    const mc = ManualClock{};
+    var lim = try RateLimiter(u32, ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 1,
         .per = .hour,
-        .clock = mc.clock(),
+        .clock = mc,
     });
     defer lim.deinit();
 
@@ -651,27 +657,27 @@ test "RateLimiter: stress — 10k unique keys" {
 }
 
 test "RateLimiter: init rejects zero rate" {
-    var mc = ManualClock{};
-    const result = StringRateLimiter.init(.{
+    const mc = ManualClock{};
+    const result = StringRateLimiter(ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 0,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
 test "RateLimiter: init rejects rate > 1 req/ns" {
-    var mc = ManualClock{};
+    const mc = ManualClock{};
     // per = .second (= 1_000_000_000 ns)
     // rate = 2_000_000_000 > 1_000_000_000
-    const result = StringRateLimiter.init(.{
+    const result = StringRateLimiter(ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 2_000_000_000,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
     try std.testing.expectError(error.RateExceedsRes, result);
 }
@@ -680,12 +686,12 @@ test "RateLimiter: per-hour config with burst and time advance" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // 1 req/hour, burst=1 → 2 immediate requests
-    var lim = try StringRateLimiter.init(.{
+    var lim = try StringRateLimiter(*ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 1,
         .per = .hour,
         .burst = 1,
-        .clock = mc.clock(),
+        .clock = &mc,
     });
     defer lim.deinit();
 
@@ -733,12 +739,12 @@ test "RateLimiter: multiple keys with different burst behavior" {
 test "RateLimiter: StringRateLimiter type alias works" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringRateLimiter.init(.{
+    var lim = try StringRateLimiter(ManualClock).init(.{
         .allocator = std.testing.allocator,
         .rate = 5,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
     defer lim.deinit();
 
@@ -749,16 +755,16 @@ test "GlobalLimiter: concurrent contention" {
     const num_threads = 4;
     const total_slots = 1000;
 
-    var sys = SystemClock.init(std.testing.io);
-    var lim = try GlobalLimiter.init(.{
+    const sys = SystemClock.init(std.testing.io);
+    var lim = try GlobalLimiter(SystemClock).init(.{
         .rate = total_slots,
         .per = .hour,
         .burst = total_slots - 1,
-        .clock = sys.clock(),
+        .clock = sys,
     });
 
     const Ctx = struct {
-        limiter: *GlobalLimiter,
+        limiter: *GlobalLimiter(SystemClock),
         allowed: std.atomic.Value(usize),
 
         fn run(ctx: *@This()) void {
@@ -787,11 +793,11 @@ test "GlobalLimiter: concurrent contention" {
 test "GlobalLimiter: basic allow and deny" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 5,
         .per = .second,
         .burst = 4, // 1 base + 4 burst = 5
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     var i: usize = 0;
@@ -804,11 +810,11 @@ test "GlobalLimiter: basic allow and deny" {
 test "GlobalLimiter: reset restores capacity" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 1,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     _ = lim.allow();
@@ -818,12 +824,12 @@ test "GlobalLimiter: reset restores capacity" {
 }
 
 test "GlobalLimiter: wait blocks and eventually succeeds" {
-    var sys = SystemClock.init(std.testing.io);
-    var lim = try GlobalLimiter.init(.{
+    const sys = SystemClock.init(std.testing.io);
+    var lim = try GlobalLimiter(SystemClock).init(.{
         .rate = 10,
         .per = .second, // 100ms per slot
         .burst = 0,
-        .clock = sys.clock(),
+        .clock = sys,
     });
 
     // Exhaust immediately
@@ -843,11 +849,11 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
 test "GlobalLimiter: allow_n batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 10,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     try std.testing.expectEqual(true, lim.allow_n(8).is_allowed());
@@ -857,11 +863,11 @@ test "GlobalLimiter: allow_n batch" {
 test "GlobalLimiter: retry_after_ms_ceil is non-zero on denial" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 1,
         .per = .second,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     _ = lim.allow();
@@ -874,11 +880,11 @@ test "GlobalLimiter: retry_after_ms_ceil is non-zero on denial" {
 test "GlobalLimiter: allow_n overflow guard" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 1,
         .per = .minute,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     const out = lim.allow_n(std.math.maxInt(u32));
@@ -895,11 +901,11 @@ test "GlobalLimiter: allow_n overflow guard" {
 test "GlobalLimiter: allow_n overflow guard does not mutate state" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try GlobalLimiter.init(.{
+    var lim = try GlobalLimiter(ManualClock).init(.{
         .rate = 1,
         .per = .minute,
         .burst = 0,
-        .clock = mc.clock(),
+        .clock = mc,
     });
 
     _ = lim.allow_n(std.math.maxInt(u32));
