@@ -8,7 +8,6 @@ const types = @import("types.zig");
 
 pub const Limit = types.Limit;
 pub const Decision = types.Decision;
-pub const Clock = types.Clock;
 pub const ZimitError = types.ZimitError;
 
 // ── Pure GCRA engine ──────────────────────────────────────────────────────────
@@ -51,7 +50,7 @@ pub fn check(
 /// keys are hashed but not copied; callers must ensure key lifetime covers the call.
 ///
 /// Thread safety: none. Wrap with a mutex if shared across threads.
-pub fn Limiter(comptime K: type) type {
+pub fn Limiter(comptime K: type, comptime ClockType: type) type {
     return struct {
         const Self = @This();
         const Store = std.HashMap(K, i64, HashContext(K), 80);
@@ -60,14 +59,14 @@ pub fn Limiter(comptime K: type) type {
         store: Store,
         emission_interval_ns: i64,
         burst_offset_ns: i64,
-        clock: Clock,
+        clock: ClockType,
         max_batch: u64,
 
         pub fn init(
             allocator: std.mem.Allocator,
             limit: Limit,
             burst: u32,
-            clock: Clock,
+            clock: ClockType,
         ) ZimitError!Self {
             if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
             if (limit.count > limit.period_ns) return error.RateExceedsRes;
@@ -189,89 +188,95 @@ fn HashContext(comptime K: type) type {
 /// Lock-free guarantee: threads never block each other. A thread that loses a
 /// CAS race retries immediately with the freshly-loaded TAT. Under zero
 /// contention the CAS always succeeds on the first attempt.
-pub const AtomicLimiter = struct {
-    tat: std.atomic.Value(i64),
-    emission_interval_ns: i64,
-    burst_offset_ns: i64,
-    clock: Clock,
-    max_batch: u64,
+pub fn AtomicLimiter(comptime ClockType: type) type {
+    return struct {
+        const Self = @This();
 
-    /// Initialise an atomic limiter.
-    ///
-    ///   limit  The rate to enforce.
-    ///   burst  Extra requests allowed in a burst (0 = no burst).
-    ///   clock  Time source.
-    pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
-        if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
-        if (limit.count > limit.period_ns) return error.RateExceedsRes;
+        tat: std.atomic.Value(i64),
+        emission_interval_ns: i64,
+        burst_offset_ns: i64,
+        clock: ClockType,
+        max_batch: u64,
 
-        const interval = limit.emission_interval();
+        /// Initialise an atomic limiter.
+        ///
+        ///   limit  The rate to enforce.
+        ///   burst  Extra requests allowed in a burst (0 = no burst).
+        ///   clock  Time source.
+        pub fn init(limit: Limit, burst: u32, clock: ClockType) ZimitError!Self {
+            if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+            if (limit.count > limit.period_ns) return error.RateExceedsRes;
 
-        return .{
-            .tat = std.atomic.Value(i64).init(0),
-            .emission_interval_ns = interval,
-            .burst_offset_ns = limit.burst_offset(burst),
-            .clock = clock,
-            .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
-        };
-    }
+            const interval = limit.emission_interval();
 
-    /// Check whether a single request is allowed right now.
-    /// Safe to call from any number of threads simultaneously.
-    pub fn allow(self: *AtomicLimiter) Decision {
-        return self.allow_n(1);
-    }
-
-    /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
-    /// are granted or none are — partial grants never occur.
-    pub fn allow_n(self: *AtomicLimiter, n: u32) Decision {
-        if (n == 0) {
-            return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+            return .{
+                .tat = std.atomic.Value(i64).init(0),
+                .emission_interval_ns = interval,
+                .burst_offset_ns = limit.burst_offset(burst),
+                .clock = clock,
+                .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
+            };
         }
 
-        if (@as(u64, n) > self.max_batch) {
-            return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+        /// Check whether a single request is allowed right now.
+        /// Safe to call from any number of threads simultaneously.
+        pub fn allow(self: *Self) Decision {
+            return self.allow_n(1);
         }
 
-        const scaled = self.emission_interval_ns * @as(i64, n);
+        /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
+        /// are granted or none are — partial grants never occur.
+        pub fn allow_n(self: *Self, n: u32) Decision {
+            if (n == 0) {
+                return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+            }
 
-        const now = self.clock.now();
+            if (@as(u64, n) > self.max_batch) {
+                return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+            }
 
-        while (true) {
-            const old_tat = self.tat.load(.monotonic);
+            const scaled = self.emission_interval_ns * @as(i64, n);
 
-            const decision = check(
-                old_tat,
-                now,
-                scaled,
-                self.burst_offset_ns,
-            );
+            while (true) {
+                const now = self.clock.now();
 
-            switch (decision) {
-                .denied => return decision,
-                .allowed => |a| {
-                    if (self.tat.cmpxchgWeak(
-                        old_tat,
-                        a.new_tat,
-                        .acq_rel,
-                        .monotonic,
-                    ) == null) {
-                        return decision;
-                    }
-                },
+                const old_tat = self.tat.load(.monotonic);
+
+                const decision = check(
+                    old_tat,
+                    now,
+                    scaled,
+                    self.burst_offset_ns,
+                );
+
+                switch (decision) {
+                    .denied => return decision,
+                    .allowed => |a| {
+                        if (self.tat.cmpxchgWeak(
+                            old_tat,
+                            a.new_tat,
+                            .acq_rel,
+                            .monotonic,
+                        ) == null) {
+                            return decision;
+                        }
+                    },
+                }
             }
         }
-    }
 
-    /// Reset the limiter to its initial state — useful in tests.
-    /// Not safe to call concurrently with `allow`.
-    pub fn reset(self: *AtomicLimiter) void {
-        self.tat.store(0, .release);
-    }
-};
+        /// Reset the limiter to its initial state — useful in tests.
+        /// Not safe to call concurrently with `allow`.
+        pub fn reset(self: *Self) void {
+            self.tat.store(0, .release);
+        }
+    };
+}
 
 /// Convenience alias for the common string-keyed limiter.
-pub const StringLimiter = Limiter([]const u8);
+pub fn StringLimiter(comptime ClockType: type) type {
+    return Limiter([]const u8, ClockType);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests — pure engine
@@ -511,34 +516,34 @@ test "check: denied retry_after is exact gap" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 test "Limiter: init rejects zero count" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
-    const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
+    const result = Limiter([]const u8, types.ManualClock).init(std.testing.allocator, bad, 0, mc);
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
 test "Limiter: init rejects rate > 1 req/ns" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 2, .period_ns = 1 };
-    const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
+    const result = Limiter([]const u8, types.ManualClock).init(std.testing.allocator, bad, 0, mc);
     try std.testing.expectError(error.RateExceedsRes, result);
 }
 
 test "Limiter: init rejects non-positive period" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 10, .period_ns = 0 };
-    const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
+    const result = Limiter([]const u8, types.ManualClock).init(std.testing.allocator, bad, 0, mc);
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
 test "Limiter: fresh key is allowed" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -549,11 +554,11 @@ test "Limiter: fresh key is allowed" {
 test "Limiter: exhausted key is denied" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(3),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -567,11 +572,11 @@ test "Limiter: exhausted key is denied" {
 test "Limiter: keys are isolated" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -583,11 +588,11 @@ test "Limiter: keys are isolated" {
 test "Limiter: time advance allows denied key" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, *types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        &mc,
     );
     defer lim.deinit();
 
@@ -603,11 +608,11 @@ test "Limiter: time advance allows denied key" {
 test "Limiter: remove clears key state" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -626,11 +631,11 @@ test "Limiter: remove clears key state" {
 test "Limiter: key_count tracks insertions" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -643,11 +648,11 @@ test "Limiter: key_count tracks insertions" {
 test "Limiter: integer key type (u64)" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try Limiter(u64).init(
+    var lim = try Limiter(u64, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(5),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -661,11 +666,11 @@ test "Limiter: integer key type (u64)" {
 test "Limiter: string key is copied — caller buffer can be mutated" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -687,11 +692,11 @@ test "Limiter: string key is copied — caller buffer can be mutated" {
 test "Limiter: remove frees copied key memory" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -712,11 +717,11 @@ test "Limiter: deinit frees all copied keys without leak" {
     // testing allocator, which detects leaks automatically on deinit.
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
 
     _ = try lim.check_key("x");
@@ -732,11 +737,11 @@ test "Limiter: same key does not duplicate allocation" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -753,11 +758,11 @@ test "Limiter: remove on missing key is safe" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -769,11 +774,11 @@ test "Limiter: many keys do not collide or corrupt" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -791,11 +796,11 @@ test "Limiter: equal string content with different backing memory hits same key"
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -812,11 +817,11 @@ test "Limiter: check_key_n denial does not change state" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, *types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(5),
         0,
-        mc.clock(),
+        &mc,
     );
     defer lim.deinit();
 
@@ -836,11 +841,11 @@ test "Limiter: retry_after_ns can be zero at boundary" {
     var mc = types.ManualClock{};
     mc.set(0);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, *types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        &mc,
     );
     defer lim.deinit();
 
@@ -856,11 +861,11 @@ test "Limiter: alternating keys do not interfere" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -878,11 +883,11 @@ test "Limiter: freed key memory reuse does not corrupt map" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -902,11 +907,11 @@ test "Limiter: check_key_n accepts maxInt(u32)" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -925,11 +930,11 @@ test "Limiter: OutOfMemory handling" {
     // std.testing.FailingAllocator fires after N successful allocations.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
 
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         failing.allocator(),
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -952,9 +957,9 @@ test "Limiter: OutOfMemory handling" {
 }
 
 test "Limiter: init rejects negative period" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 10, .period_ns = -1 };
-    const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
+    const result = Limiter([]const u8, types.ManualClock).init(std.testing.allocator, bad, 0, mc);
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
@@ -963,11 +968,11 @@ test "Limiter: batch on fresh key always allowed (TAT pushes forward)" {
     mc.set(std.time.ns_per_s);
     // rate=10/s, burst=2 → for fresh keys, any batch is allowed
     // because allow_at = max(0, now) - burst_offset = now - burst_offset <= now
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         2,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -983,11 +988,11 @@ test "Limiter: batch on fresh key always allowed (TAT pushes forward)" {
 test "Limiter: check_key_n n=0 on missing key does not insert" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(10),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -999,11 +1004,11 @@ test "Limiter: check_key_n n=0 on missing key does not insert" {
 test "Limiter: remove then reinsert gets fresh state" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -1027,11 +1032,11 @@ test "Limiter: remove then reinsert gets fresh state" {
 test "Limiter: per-hour config with time advance" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try Limiter(u64).init(
+    var lim = try Limiter(u64, *types.ManualClock).init(
         std.testing.allocator,
         Limit.per_hour(1),
         0,
-        mc.clock(),
+        &mc,
     );
     defer lim.deinit();
 
@@ -1053,11 +1058,11 @@ test "Limiter: burst with integer keys" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=5/s, burst=4 → 5 requests at once
-    var lim = try Limiter(u32).init(
+    var lim = try Limiter(u32, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(5),
         4,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -1071,11 +1076,11 @@ test "Limiter: burst with integer keys" {
 test "Limiter: denied on existing key does not insert second key" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try StringLimiter.init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_second(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -1092,11 +1097,11 @@ test "Limiter: overflow guard denies fresh key without inserting" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // per_minute(1) → interval=60e9 → max_batch=153 < maxInt(u32)
-    var lim = try Limiter([]const u8).init(
+    var lim = try Limiter([]const u8, types.ManualClock).init(
         std.testing.allocator,
         Limit.per_minute(1),
         0,
-        mc.clock(),
+        mc,
     );
     defer lim.deinit();
 
@@ -1113,7 +1118,7 @@ test "Limiter: overflow guard denies fresh key without inserting" {
 test "AtomicLimiter: fresh limiter allows first request" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(10), 0, mc);
     const d = lim.allow();
     try std.testing.expect(d.is_allowed());
 }
@@ -1121,7 +1126,7 @@ test "AtomicLimiter: fresh limiter allows first request" {
 test "AtomicLimiter: exhausted limiter denies" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(3), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(3), 0, mc);
 
     _ = lim.allow();
     _ = lim.allow();
@@ -1132,7 +1137,7 @@ test "AtomicLimiter: exhausted limiter denies" {
 test "AtomicLimiter: time advance unblocks" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+    var lim = try AtomicLimiter(*types.ManualClock).init(Limit.per_second(1), 0, &mc);
 
     _ = lim.allow();
     try std.testing.expect(!lim.allow().is_allowed());
@@ -1145,7 +1150,7 @@ test "AtomicLimiter: burst allows base+burst requests" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // burst=4 → 1+4 = 5 requests at t=0
-    var lim = try AtomicLimiter.init(Limit.per_second(10), 4, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(10), 4, mc);
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
@@ -1157,7 +1162,7 @@ test "AtomicLimiter: burst allows base+burst requests" {
 test "AtomicLimiter: allow_n consumes slots atomically" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(10), 0, mc);
 
     try std.testing.expect(lim.allow_n(7).is_allowed());
     try std.testing.expect(!lim.allow_n(4).is_allowed());
@@ -1166,7 +1171,7 @@ test "AtomicLimiter: allow_n consumes slots atomically" {
 test "AtomicLimiter: allow_n=0 always allowed, no state change" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(1), 0, mc);
 
     _ = lim.allow(); // exhaust
     try std.testing.expect(!lim.allow().is_allowed());
@@ -1177,7 +1182,7 @@ test "AtomicLimiter: allow_n=0 always allowed, no state change" {
 test "AtomicLimiter: denied allow_n leaves TAT unchanged" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(5), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(5), 0, mc);
 
     try std.testing.expect(lim.allow_n(3).is_allowed());
 
@@ -1192,7 +1197,7 @@ test "AtomicLimiter: denied allow_n leaves TAT unchanged" {
 test "AtomicLimiter: reset clears state" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(1), 0, mc);
 
     _ = lim.allow();
     try std.testing.expect(!lim.allow().is_allowed());
@@ -1204,7 +1209,7 @@ test "AtomicLimiter: reset clears state" {
 test "AtomicLimiter: retry_after_ns is positive on denial" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(1), 0, mc);
 
     _ = lim.allow();
     const d = lim.allow();
@@ -1215,26 +1220,26 @@ test "AtomicLimiter: retry_after_ns is positive on denial" {
 }
 
 test "AtomicLimiter: init rejects zero count" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
     try std.testing.expectError(
         error.InvalidLimit,
-        AtomicLimiter.init(bad, 0, mc.clock()),
+        AtomicLimiter(types.ManualClock).init(bad, 0, mc),
     );
 }
 
 test "AtomicLimiter: init rejects rate > 1 req/ns" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 2, .period_ns = 1 };
     try std.testing.expectError(
         error.RateExceedsRes,
-        AtomicLimiter.init(bad, 0, mc.clock()),
+        AtomicLimiter(types.ManualClock).init(bad, 0, mc),
     );
 }
 
 test "AtomicLimiter: sustained throughput matches rate" {
     var mc = types.ManualClock{};
-    var lim = try AtomicLimiter.init(Limit.per_second(100), 0, mc.clock());
+    var lim = try AtomicLimiter(*types.ManualClock).init(Limit.per_second(100), 0, &mc);
 
     var allowed: usize = 0;
     var t: i64 = 0;
@@ -1251,7 +1256,7 @@ test "AtomicLimiter: allow_n overflow guard denies without panic" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try AtomicLimiter.init(Limit.per_second(10), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(10), 0, mc);
 
     // max_batch = maxInt(i64) / 100_000_000 = 92, so 93 exceeds it
     if (lim.max_batch >= std.math.maxInt(u32)) return; // avoid invalid cast
@@ -1264,7 +1269,7 @@ test "AtomicLimiter: allow_n overflow guard denies without panic" {
 test "AtomicLimiter: allow_n overflow guard leaves TAT unchanged" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_minute(1), 0, mc);
 
     const tat_before = lim.tat.load(.monotonic);
     const n: u32 = @intCast(lim.max_batch + 1);
@@ -1276,7 +1281,7 @@ test "AtomicLimiter: allow_n overflow guard leaves TAT unchanged" {
 test "AtomicLimiter: allow_n overflow guard returns maxInt retry_after" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_minute(1), 0, mc);
 
     const n: u32 = @intCast(lim.max_batch + 1);
     const d = lim.allow_n(n);
@@ -1294,7 +1299,7 @@ test "AtomicLimiter: allow_n large but valid n still works" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_minute(1), 0, mc);
 
     const n: u32 = 100;
     try std.testing.expect(@as(u64, n) <= lim.max_batch);
@@ -1314,7 +1319,7 @@ test "AtomicLimiter: allow_n boundary exactly at max_batch does not overflow" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try AtomicLimiter.init(Limit.per_minute(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_minute(1), 0, mc);
 
     const n: u32 = @intCast(lim.max_batch);
     const d = lim.allow_n(n);
@@ -1329,18 +1334,18 @@ test "AtomicLimiter: allow_n boundary exactly at max_batch does not overflow" {
 }
 
 test "AtomicLimiter: init rejects negative period" {
-    var mc = types.ManualClock{};
+    const mc = types.ManualClock{};
     const bad = Limit{ .count = 10, .period_ns = -1 };
     try std.testing.expectError(
         error.InvalidLimit,
-        AtomicLimiter.init(bad, 0, mc.clock()),
+        AtomicLimiter(types.ManualClock).init(bad, 0, mc),
     );
 }
 
 test "AtomicLimiter: denial has finite retry_after (not overflow guard)" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 0, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(1), 0, mc);
 
     _ = lim.allow();
     const d = lim.allow();
@@ -1359,7 +1364,7 @@ test "AtomicLimiter: reset then full capacity available" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=5/s, burst=4 → 5 at once
-    var lim = try AtomicLimiter.init(Limit.per_second(5), 4, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(5), 4, mc);
 
     // Exhaust all slots
     var i: usize = 0;
@@ -1381,7 +1386,7 @@ test "AtomicLimiter: burst replenishes over time" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=1/s, burst=1 → 2 at once, replenish 1 per second
-    var lim = try AtomicLimiter.init(Limit.per_second(1), 1, mc.clock());
+    var lim = try AtomicLimiter(*types.ManualClock).init(Limit.per_second(1), 1, &mc);
 
     // Use both slots
     try std.testing.expect(lim.allow().is_allowed());
@@ -1398,7 +1403,7 @@ test "AtomicLimiter: allow_n with batch=2 on rate=10/s with burst" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=10/s, burst=9 → 10 slots available at once
-    var lim = try AtomicLimiter.init(Limit.per_second(10), 9, mc.clock());
+    var lim = try AtomicLimiter(types.ManualClock).init(Limit.per_second(10), 9, mc);
 
     // 5 batches of 2 should exhaust 10 slots
     var i: usize = 0;
@@ -1424,15 +1429,15 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
     const num_threads = 8;
     const requests_per_thread = 200;
 
-    var sys = types.SystemClock.init(std.testing.io);
-    var lim = try AtomicLimiter.init(
+    const sys = types.SystemClock.init(std.testing.io);
+    var lim = try AtomicLimiter(types.SystemClock).init(
         Limit.per_second(1000),
         0,
-        sys.clock(),
+        sys,
     );
 
     const Ctx = struct {
-        limiter: *AtomicLimiter,
+        limiter: *AtomicLimiter(types.SystemClock),
         allowed: std.atomic.Value(usize),
 
         fn run(ctx: *@This()) void {
@@ -1478,16 +1483,16 @@ test "AtomicLimiter: concurrent allows — no lost updates under contention" {
     const num_threads = 8;
     const requests_per_thread = 20; // 160 total attempts for 50 slots
 
-    var sys = types.SystemClock.init(std.testing.io);
+    const sys = types.SystemClock.init(std.testing.io);
     // Large period so slots don't replenish during the test
-    var lim = try AtomicLimiter.init(
+    var lim = try AtomicLimiter(types.SystemClock).init(
         Limit{ .count = total_slots, .period_ns = std.time.ns_per_s },
         total_slots - 1, // critical
-        sys.clock(),
+        sys,
     );
 
     const Ctx = struct {
-        limiter: *AtomicLimiter,
+        limiter: *AtomicLimiter(types.SystemClock),
         allowed: std.atomic.Value(usize),
 
         fn run(ctx: *@This()) void {
