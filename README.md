@@ -1,6 +1,6 @@
 # zimit
 
-A GCRA-based rate limiter for Zig 0.16.0+ with a token-bucket-like API.
+A zero-dependency GCRA-based rate limiter for Zig 0.16.0+ with a token-bucket-like API.
 
 ## Installation
 
