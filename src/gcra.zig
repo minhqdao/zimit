@@ -237,9 +237,9 @@ pub fn AtomicLimiter(comptime ClockType: type) type {
 
             const scaled = self.emission_interval_ns * @as(i64, n);
 
-            const now = self.clock.now();
-
             while (true) {
+                const now = self.clock.now();
+
                 const old_tat = self.tat.load(.monotonic);
 
                 const decision = check(
