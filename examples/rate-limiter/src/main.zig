@@ -5,7 +5,7 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var sys = zimit.SystemClock.init(io);
+    var sy = zimit.SystemClock.init(io);
 
     var limiter = try zimit.RateLimiter([]const u8).init(.{
         .allocator = gpa,
