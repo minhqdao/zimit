@@ -10,7 +10,7 @@ Add to your `build.zig.zon`:
 .dependencies = .{
     .zimit = .{
         .url = "https://github.com/minhqdao/zimit/archive/0.2.1.tar.gz",
-        .hash = "...",
+        .hash = "zimit-0.2.1-PtOTg1WIAQA_8l-Qv1udeHK7ATsY86s-P8vFAyyb_qOK",
     },
 },
 ```
