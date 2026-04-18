@@ -75,8 +75,8 @@ See [examples](examples) for more.
 
 ## Notes
 
-- **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address).
-- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput).
+- **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you must protect it with a `std.Io.Mutex`.
+- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). The `GlobalLimiter` is lock-free and thread-safe.
 - **Blocking vs non-blocking:**
   - `allow()` → Immediate decision
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)

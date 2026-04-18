@@ -6,23 +6,35 @@
 //!     const zimit = @import("zimit");
 //!
 //! pub fn main(init: std.process.Init) !void {
-//!     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-//!     defer _ = gpa.deinit();
+//!     const gpa = init.gpa;
+//!     const io = init.io;
 //!
-//!     var sys_clock = zimit.SystemClock.init(init.io);
+//!     var sys = zimit.SystemClock.init(io);
+//!
 //!     var limiter = try zimit.RateLimiter([]const u8).init(.{
-//!         .allocator  = gpa.allocator(),
-//!         .rate       = 100,          // 100 requests …
-//!         .per        = .second,      // … per second
-//!         .burst      = 20,           // allow up to 20 extra in a burst
-//!         .clock      = sys_clock.clock(),
+//!         .allocator = gpa,
+//!         .rate = 5,
+//!         .per = .second,
+//!         .burst = 2,
+//!         .clock = sys.clock(),
 //!     });
 //!     defer limiter.deinit();
 //!
-//!     switch (try limiter.allow("192.168.1.1")) {
-//!         .allowed => handleRequest(),
-//!         .denied  => |d| return error429(d.retry_after_ms_ceil()),
+//!     const key = "127.0.0.1";
+//!
+//!     var i: usize = 0;
+//!     while (i < 5) : (i += 1) {
+//!         switch (try limiter.allow(key)) {
+//!             .allowed => std.debug.print("allowed\n", .{}),
+//!             .denied => |d| {
+//!                 std.debug.print("denied, time until allowed: {d}ms\n", .{d.retry_after_ms_ceil()});
+//!             },
+//!         }
 //!     }
+//! }
+//!
+//! Note: `RateLimiter` is **not** thread-safe. Wrap it in a `std.Io.Mutex` if
+//! shared. For a thread-safe global limit, use `GlobalLimiter`.
 
 const std = @import("std");
 const gcra = @import("gcra.zig");
@@ -105,6 +117,10 @@ pub const Outcome = union(enum) {
 /// threads — for example, "this service may make at most N outbound calls/s".
 ///
 /// For per-key limits use `RateLimiter(K)`.
+///
+/// ### Thread Safety
+/// This type is **thread-safe**. It can be used across multiple threads without
+/// additional synchronization.
 pub const GlobalLimiter = struct {
     inner: gcra.AtomicLimiter,
 
@@ -161,7 +177,11 @@ pub const GlobalLimiter = struct {
 /// (user ID, session ID). All keys are isolated; one key's limit does not
 /// affect another's.
 ///
-/// Thread safety: none. Wrap with a mutex if shared across threads.
+/// ### Thread Safety
+/// This type is **not** thread-safe. If you need to use the same `RateLimiter`
+/// instance across multiple threads, you must wrap it in a `std.Io.Mutex`.
+///
+/// For a thread-safe global limiter that doesn't require keys, see `GlobalLimiter`.
 pub fn RateLimiter(comptime K: type) type {
     return struct {
         const Self = @This();

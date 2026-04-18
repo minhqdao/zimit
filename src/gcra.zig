@@ -47,10 +47,13 @@ pub fn check(
 
 /// A rate limiter that tracks an arbitrary number of keys (IPs, user IDs, etc.).
 ///
-/// Keys are `[]const u8`. The limiter owns no memory beyond the HashMap itself —
-/// keys are hashed but not copied; callers must ensure key lifetime covers the call.
+/// Keys are `K`. The limiter owns no memory beyond the HashMap itself —
+/// keys are hashed but not copied (unless K is []const u8, in which case
+/// the Limiter copies them to its own allocator).
 ///
-/// Thread safety: none. Wrap with a mutex if shared across threads.
+/// ### Thread Safety
+/// This type is **not** thread-safe. If you need to use the same `Limiter`
+/// instance across multiple threads, you must wrap it in a `std.Io.Mutex`.
 pub fn Limiter(comptime K: type) type {
     return struct {
         const Self = @This();
@@ -183,12 +186,13 @@ fn HashContext(comptime K: type) type {
 /// for example, "this process may make at most N outbound API calls per second"
 /// regardless of which thread is making them.
 ///
-/// For per-key limits (per IP, per user) use `Limiter(K)` protected by a Mutex,
-/// or a sharded design. `AtomicLimiter` tracks exactly one token bucket.
+/// For per-key limits (per IP, per user) use `Limiter(K)` wrapped in a 
+/// `std.Io.Mutex`, or a sharded design. `AtomicLimiter` tracks exactly one
+/// token bucket.
 ///
-/// Lock-free guarantee: threads never block each other. A thread that loses a
-/// CAS race retries immediately with the freshly-loaded TAT. Under zero
-/// contention the CAS always succeeds on the first attempt.
+/// ### Thread Safety
+/// This type is **thread-safe**. Threads never block each other;
+/// a thread that loses a CAS race retries immediately with the freshly-loaded TAT.
 pub const AtomicLimiter = struct {
     tat: std.atomic.Value(i64),
     emission_interval_ns: i64,
