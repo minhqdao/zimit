@@ -30,8 +30,7 @@ const types = @import("types.zig");
 
 // ── Re-exports (callers only need to import "zimit") ─────────────────────────
 
-pub const Limit = types.Limit;
-pub const Decision = types.Decision;
+const Limit = types.Limit;
 pub const SystemClock = types.SystemClock;
 pub const ManualClock = types.ManualClock;
 pub const ZimitError = types.ZimitError;

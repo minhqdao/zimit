@@ -6,9 +6,9 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-pub const Limit = types.Limit;
-pub const Decision = types.Decision;
-pub const ZimitError = types.ZimitError;
+const Limit = types.Limit;
+const Decision = types.Decision;
+const ZimitError = types.ZimitError;
 
 // ── Pure GCRA engine ──────────────────────────────────────────────────────────
 
@@ -23,7 +23,7 @@ pub const ZimitError = types.ZimitError;
 ///
 /// Returns a `Decision`. On `.allowed`, persist `decision.new_tat` back to
 /// your store. On `.denied`, wait `decision.retry_after_ns` before retrying.
-pub fn check(
+fn check(
     tat: i64,
     now_ns: i64,
     emission_interval_ns: i64,
@@ -271,11 +271,6 @@ pub fn AtomicLimiter(comptime ClockType: type) type {
             self.tat.store(0, .release);
         }
     };
-}
-
-/// Convenience alias for the common string-keyed limiter.
-pub fn StringLimiter(comptime ClockType: type) type {
-    return Limiter([]const u8, ClockType);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
