@@ -186,7 +186,7 @@ fn HashContext(comptime K: type) type {
 /// for example, "this process may make at most N outbound API calls per second"
 /// regardless of which thread is making them.
 ///
-/// For per-key limits (per IP, per user) use `Limiter(K)` wrapped in a 
+/// For per-key limits (per IP, per user) use `Limiter(K)` wrapped in a
 /// `std.Io.Mutex`, or a sharded design. `AtomicLimiter` tracks exactly one
 /// token bucket.
 ///
