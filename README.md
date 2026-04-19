@@ -53,18 +53,13 @@ See [examples](examples) for more.
 
 ## Installation
 
-Add to your `build.zig.zon`:
+Run:
 
-```zig
-.dependencies = .{
-    .zimit = .{
-        .url = "https://github.com/minhqdao/zimit/archive/0.2.1.tar.gz",
-        .hash = "zimit-0.2.1-PtOTg1WIAQA_8l-Qv1udeHK7ATsY86s-P8vFAyyb_qOK",
-    },
-},
+```shell
+    zig fetch --save git+https://github.com/minhqdao/zimit.git#0.2.1
 ```
 
-Then in `build.zig`:
+Then in your `build.zig`:
 
 ```zig
 const zimit_dep = b.dependency("zimit", .{
