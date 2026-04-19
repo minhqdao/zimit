@@ -2,39 +2,16 @@
 
 A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0.16.0+.
 
-## Installation
+## Features
 
-Add to your `build.zig.zon`:
-
-```zig
-.dependencies = .{
-    .zimit = .{
-        .url = "https://github.com/minhqdao/zimit/archive/0.2.1.tar.gz",
-        .hash = "zimit-0.2.1-PtOTg1WIAQA_8l-Qv1udeHK7ATsY86s-P8vFAyyb_qOK",
-    },
-},
-```
-
-Then in `build.zig`:
-
-```zig
-const zimit_dep = b.dependency("zimit", .{
-    .target = target,
-    .optimize = optimize,
-});
-
-const exe = b.addExecutable(.{
-    .name = "yourapp",
-    .root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "zimit", .module = zimit_dep.module("zimit") },
-        },
-    }),
-});
-```
+- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). It's lock-free and thread-safe.
+- **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
+- **Blocking vs non-blocking:**
+  - `allow()` → Immediate decision
+  - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
+- **Clocks:**
+  - `SystemClock` → Production (requires `std.process.Init.io`)
+  - `ManualClock` → Deterministic tests
 
 ## Usage
 
@@ -73,13 +50,40 @@ pub fn main(init: std.process.Init) !void {
 ```
 See [examples](examples) for more.
 
-## Notes
 
-- **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you must protect it with a `std.Io.Mutex`.
-- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). The `GlobalLimiter` is lock-free and thread-safe.
-- **Blocking vs non-blocking:**
-  - `allow()` → Immediate decision
-  - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
-- **Clocks:**
-  - `SystemClock` → Production (requires `std.process.Init.io`)
-  - `ManualClock` → Deterministic tests
+## Installation
+
+Add to your `build.zig.zon`:
+
+```zig
+.dependencies = .{
+    .zimit = .{
+        .url = "https://github.com/minhqdao/zimit/archive/0.2.1.tar.gz",
+        .hash = "zimit-0.2.1-PtOTg1WIAQA_8l-Qv1udeHK7ATsY86s-P8vFAyyb_qOK",
+    },
+},
+```
+
+Then in `build.zig`:
+
+```zig
+const zimit_dep = b.dependency("zimit", .{
+    .target = target,
+    .optimize = optimize,
+});
+
+const exe = b.addExecutable(.{
+    .name = "yourapp",
+    .root_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zimit", .module = zimit_dep.module("zimit") },
+        },
+    }),
+});
+```
+
+## License
+[MIT](LICENSE)
