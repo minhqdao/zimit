@@ -56,7 +56,7 @@ See [examples](examples) for more.
 Run:
 
 ```shell
-    zig fetch --save git+https://github.com/minhqdao/zimit.git#0.2.1
+zig fetch --save git+https://github.com/minhqdao/zimit.git#0.2.1
 ```
 
 Then in your `build.zig`:
