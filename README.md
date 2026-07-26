@@ -58,6 +58,12 @@ For an arbitrary period, initialize `Limit` directly with `count` and
 
 See [examples](examples) for more.
 
+## Key types
+
+String keys are copied automatically, and integer keys work directly.
+Applications using structured keys with custom equality or memory ownership can
+use `RateLimiterWithContext`.
+
 
 ## Installation
 
