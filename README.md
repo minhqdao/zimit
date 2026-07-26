@@ -9,7 +9,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 - **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with `idle_timeout_ns` to bound memory and reclaim inactive, fully-drained keys. Explicit `pruneExpired()` calls return an allocation error if pruning scratch space cannot be reserved.
 - **Blocking vs non-blocking:**
   - `allow()` → Immediate `Decision`; denied results carry a `std.Io.Duration`
-  - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; larger batches are denied.
+  - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; impossible batches return `error.BatchTooLarge`.
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
   - `waitN(io, n)` / `waitN(io, key, n)` → Blocks until an entire batch is allowed; impossible batches return `error.BatchTooLarge`.
 - **Clocks:**

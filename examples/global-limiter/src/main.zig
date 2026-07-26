@@ -11,7 +11,7 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        const decision = limiter.allow();
+        const decision = try limiter.allow();
         switch (decision) {
             .allowed => std.debug.print("allowed\n", .{}),
             .denied => {
