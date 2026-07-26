@@ -99,5 +99,13 @@ python3 tools/zls_lint.py
 
 The script sends every project Zig source file to ZLS and fails on any diagnostic, using the same results reported by editor integrations.
 
+## Testing
+
+Run the test suite with:
+
+```shell
+zig build test
+```
+
 ## License
 [MIT](LICENSE)

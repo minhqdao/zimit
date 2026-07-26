@@ -47,19 +47,53 @@ fn checkN(
 ) Decision {
     std.debug.assert(n > 0);
 
-    const batch_interval_ns = emission_interval_ns * @as(i64, n);
+    // Wider intermediates preserve the exact admission calculation even when
+    // the resulting TAT or retry duration lies outside the stored i64 range.
+    const batch_interval_ns = @as(i128, emission_interval_ns) * @as(i128, n);
 
     // The TAT we would assign if we allow this request.
-    const new_tat = @max(tat, now_ns) + batch_interval_ns;
+    const new_tat = @as(i128, @max(tat, now_ns)) + batch_interval_ns;
 
     // The earliest `now` at which this request is valid, given the burst allowance.
-    const allow_at = new_tat - burst_offset_ns - emission_interval_ns;
+    const allow_at = new_tat - @as(i128, burst_offset_ns) - @as(i128, emission_interval_ns);
 
     if (allow_at <= now_ns) {
-        return .{ .allowed = .{ .new_tat = new_tat } };
+        if (new_tat > std.math.maxInt(i64) or new_tat < std.math.minInt(i64)) {
+            return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+        }
+        return .{ .allowed = .{ .new_tat = @intCast(new_tat) } };
     } else {
-        return .{ .denied = .{ .retry_after_ns = allow_at - now_ns } };
+        return .{ .denied = .{ .retry_after_ns = saturatingI64(allow_at - @as(i128, now_ns)) } };
     }
+}
+
+fn saturatingI64(value: i128) i64 {
+    if (value > std.math.maxInt(i64)) return std.math.maxInt(i64);
+    if (value < std.math.minInt(i64)) return std.math.minInt(i64);
+    return @intCast(value);
+}
+
+const Parameters = struct {
+    interval: i64,
+    burst_offset: i64,
+    max_batch: u64,
+    burst_capacity: u64,
+};
+
+fn deriveParameters(limit: Limit, burst: u32) ZimitError!Parameters {
+    if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
+    if (limit.count > limit.period_ns) return error.RateExceedsRes;
+
+    const interval = limit.emissionInterval();
+    const burst_product = @mulWithOverflow(interval, @as(i64, burst));
+    if (burst_product[1] != 0) return error.TimeOverflow;
+
+    return .{
+        .interval = interval,
+        .burst_offset = burst_product[0],
+        .max_batch = @intCast(@divFloor(std.math.maxInt(i64), interval)),
+        .burst_capacity = @as(u64, burst) + 1,
+    };
 }
 
 // ── Multi-key Limiter ─────────────────────────────────────────────────────────
@@ -92,17 +126,15 @@ pub fn Limiter(comptime K: type) type {
             burst: u32,
             clock: Clock,
         ) ZimitError!Self {
-            if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
-            if (limit.count > limit.period_ns) return error.RateExceedsRes;
-            const interval = limit.emissionInterval();
+            const parameters = try deriveParameters(limit, burst);
             return .{
                 .allocator = allocator,
                 .store = Store.init(allocator),
-                .emission_interval_ns = interval,
-                .burst_offset_ns = limit.burstOffset(burst),
+                .emission_interval_ns = parameters.interval,
+                .burst_offset_ns = parameters.burst_offset,
                 .clock = clock,
-                .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
-                .burst_capacity = @as(u64, burst) + 1,
+                .max_batch = parameters.max_batch,
+                .burst_capacity = parameters.burst_capacity,
             };
         }
 
@@ -229,18 +261,15 @@ pub const AtomicLimiter = struct {
     ///   burst  Extra requests allowed in a burst (0 = no burst).
     ///   clock  Time source.
     pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
-        if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
-        if (limit.count > limit.period_ns) return error.RateExceedsRes;
-
-        const interval = limit.emissionInterval();
+        const parameters = try deriveParameters(limit, burst);
 
         return .{
             .tat = std.atomic.Value(i64).init(0),
-            .emission_interval_ns = interval,
-            .burst_offset_ns = limit.burstOffset(burst),
+            .emission_interval_ns = parameters.interval,
+            .burst_offset_ns = parameters.burst_offset,
             .clock = clock,
-            .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
-            .burst_capacity = @as(u64, burst) + 1,
+            .max_batch = parameters.max_batch,
+            .burst_capacity = parameters.burst_capacity,
         };
     }
 
@@ -489,6 +518,44 @@ test "check: tat far in the future without burst is denied" {
     const future_tat = now + 100 * interval; // 100 slots ahead
     const d = check(future_tat, now, interval, 0);
     try std.testing.expect(!d.isAllowed());
+}
+
+test "check: unrepresentable new TAT fails closed" {
+    const d = check(
+        std.math.maxInt(i64) - 5,
+        std.math.maxInt(i64) - 5,
+        10,
+        0,
+    );
+
+    try std.testing.expect(!d.isAllowed());
+    try std.testing.expectEqual(
+        @as(i64, std.math.maxInt(i64)),
+        d.denied.retry_after_ns,
+    );
+}
+
+test "check: allow_at subtraction cannot underflow" {
+    const now = std.math.minInt(i64);
+    const d = check(now, now, 10, std.math.maxInt(i64));
+
+    try std.testing.expect(d.isAllowed());
+    try std.testing.expectEqual(now + 10, d.allowed.new_tat);
+}
+
+test "check: retry duration saturates instead of overflowing" {
+    const d = check(
+        std.math.maxInt(i64),
+        std.math.minInt(i64),
+        1,
+        0,
+    );
+
+    try std.testing.expect(!d.isAllowed());
+    try std.testing.expectEqual(
+        @as(i64, std.math.maxInt(i64)),
+        d.denied.retry_after_ns,
+    );
 }
 
 test "check: burstOffset exactly equal to interval allows 2 requests at same time" {
@@ -985,6 +1052,19 @@ test "Limiter: init rejects negative period" {
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
+test "Limiter: init rejects unrepresentable burst offset" {
+    var mc = types.ManualClock{};
+    try std.testing.expectError(
+        error.TimeOverflow,
+        StringLimiter.init(
+            std.testing.allocator,
+            .{ .count = 1, .period_ns = std.math.maxInt(i64) },
+            2,
+            mc.clock(),
+        ),
+    );
+}
+
 test "Limiter: batch on fresh key cannot exceed burst capacity" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
@@ -1365,6 +1445,36 @@ test "AtomicLimiter: init rejects negative period" {
         error.InvalidLimit,
         AtomicLimiter.init(bad, 0, mc.clock()),
     );
+}
+
+test "AtomicLimiter: init rejects unrepresentable burst offset" {
+    var mc = types.ManualClock{};
+    try std.testing.expectError(
+        error.TimeOverflow,
+        AtomicLimiter.init(
+            .{ .count = 1, .period_ns = std.math.maxInt(i64) },
+            2,
+            mc.clock(),
+        ),
+    );
+}
+
+test "AtomicLimiter: unrepresentable future TAT fails closed" {
+    var mc = types.ManualClock{};
+    mc.set(std.math.maxInt(i64) - 5);
+    var lim = try AtomicLimiter.init(
+        .{ .count = 1, .period_ns = 10 },
+        0,
+        mc.clock(),
+    );
+
+    const d = lim.allow();
+    try std.testing.expect(!d.isAllowed());
+    try std.testing.expectEqual(
+        @as(i64, std.math.maxInt(i64)),
+        d.denied.retry_after_ns,
+    );
+    try std.testing.expectEqual(@as(i64, 0), lim.tat.load(.monotonic));
 }
 
 test "AtomicLimiter: denial has finite retry_after (not overflow guard)" {

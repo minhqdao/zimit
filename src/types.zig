@@ -20,14 +20,18 @@ pub const Limit = struct {
 
     /// Derived: nanoseconds between each emission (period / count).
     /// This is the fundamental GCRA unit — one "slot" of time.
+    /// Returns 0 when `count` is 0; limiter initialization rejects that limit.
     pub fn emissionInterval(self: Limit) i64 {
+        if (self.count == 0) return 0;
         return @divTrunc(self.period_ns, @as(i64, self.count));
     }
 
     /// Nanoseconds a burst of `burst` extra requests buys you.
     /// In GCRA terms: how far in the past the TAT may be before we reject.
+    /// Saturates at the `i64` bounds; limiter initialization reports
+    /// `error.TimeOverflow` instead of accepting a saturated burst offset.
     pub fn burstOffset(self: Limit, burst: u32) i64 {
-        return self.emissionInterval() * @as(i64, burst);
+        return self.emissionInterval() *| @as(i64, burst);
     }
 
     // ── Convenience constructors ────────────────────────────────────────────
@@ -111,7 +115,12 @@ pub const SystemClock = struct {
     fn nowImpl(ptr: *anyopaque) i64 {
         const self: *SystemClock = @ptrCast(@alignCast(ptr));
         const ts = std.Io.Clock.awake.now(self.io);
-        return @intCast(ts.toNanoseconds());
+        const ns = ts.toNanoseconds();
+        return @intCast(std.math.clamp(
+            ns,
+            std.math.minInt(i64),
+            std.math.maxInt(i64),
+        ));
     }
 };
 
@@ -131,8 +140,9 @@ pub const ManualClock = struct {
     }
 
     /// Advances the clock by a duration in nanoseconds.
+    /// Saturates at the `i64` bounds instead of overflowing.
     pub fn tick(self: *ManualClock, ns: i64) void {
-        self.time_ns += ns;
+        self.time_ns +|= ns;
     }
 
     fn nowImpl(ptr: *anyopaque) i64 {
@@ -150,6 +160,8 @@ pub const ZimitError = error{
     RateExceedsRes,
     /// Out of memory when inserting a new key into the store.
     OutOfMemory,
+    /// Derived time values cannot be represented in nanoseconds.
+    TimeOverflow,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -174,6 +186,19 @@ test "Limit.burstOffset: 100 req/s burst=10 → 100ms" {
 test "Limit.burstOffset: no burst → 0" {
     const l = Limit.perSecond(50);
     try std.testing.expectEqual(@as(i64, 0), l.burstOffset(0));
+}
+
+test "Limit.emissionInterval: zero count is non-trapping" {
+    const limit = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
+    try std.testing.expectEqual(@as(i64, 0), limit.emissionInterval());
+}
+
+test "Limit.burstOffset: saturates on overflow" {
+    const limit = Limit{ .count = 1, .period_ns = std.math.maxInt(i64) };
+    try std.testing.expectEqual(
+        @as(i64, std.math.maxInt(i64)),
+        limit.burstOffset(2),
+    );
 }
 
 test "Limit.perMinute: 60 req/min → 1s emission interval" {
@@ -310,6 +335,18 @@ test "ManualClock: set then tick combines correctly" {
     c.set(5_000_000_000); // 5s
     c.tick(2_000_000_000); // +2s
     try std.testing.expectEqual(@as(i64, 7_000_000_000), c.clock().now());
+}
+
+test "ManualClock: tick saturates at maximum" {
+    var c = ManualClock{ .time_ns = std.math.maxInt(i64) - 1 };
+    c.tick(2);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), c.clock().now());
+}
+
+test "ManualClock: negative tick saturates at minimum" {
+    var c = ManualClock{ .time_ns = std.math.minInt(i64) + 1 };
+    c.tick(-2);
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), c.clock().now());
 }
 
 test "Decision: allowed isAllowed returns true" {
