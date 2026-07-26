@@ -9,8 +9,7 @@ pub fn main(init: std.process.Init) !void {
 
     var limiter = try zimit.RateLimiter([]const u8).init(.{
         .allocator = gpa,
-        .rate = 5,
-        .per = .second,
+        .limit = .perSecond(5),
         .burst = 2,
         .clock = sys.clock(),
     });

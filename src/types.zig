@@ -36,17 +36,17 @@ pub const Limit = struct {
 
     // ── Convenience constructors ────────────────────────────────────────────
 
-    /// 1 request per second.
+    /// `count` requests per second.
     pub fn perSecond(count: u32) Limit {
         return .{ .count = count, .period_ns = std.time.ns_per_s };
     }
 
-    /// 1 request per minute.
+    /// `count` requests per minute.
     pub fn perMinute(count: u32) Limit {
         return .{ .count = count, .period_ns = 60 * std.time.ns_per_s };
     }
 
-    /// 1 request per hour.
+    /// `count` requests per hour.
     pub fn perHour(count: u32) Limit {
         return .{ .count = count, .period_ns = 3600 * std.time.ns_per_s };
     }
