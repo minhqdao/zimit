@@ -231,6 +231,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         max_entries: ?usize,
         idle_timeout_ns: ?i64,
         next_prune_ns: i64,
+        expired_keys: std.ArrayList(K),
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -297,6 +298,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
                 .max_entries = storage.max_entries,
                 .idle_timeout_ns = storage.idle_timeout_ns,
                 .next_prune_ns = std.math.maxInt(i64),
+                .expired_keys = .empty,
             };
         }
 
@@ -307,6 +309,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
                 self.deinitKey(entry.key_ptr.*);
             }
             self.store.deinit();
+            self.expired_keys.deinit(self.allocator);
         }
 
         /// Convenience for `checkKeyN(key, 1)`.
@@ -383,49 +386,66 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
 
         /// Remove entries that are idle and have no outstanding rate-limit debt.
         /// Returns the number of entries removed.
-        pub fn pruneExpired(self: *Self) usize {
-            return self.pruneExpiredAt(self.engine.clock.now());
+        pub fn pruneExpired(self: *Self) ZimitError!usize {
+            return try self.pruneExpiredAt(self.engine.clock.now());
         }
 
         fn maintainForNewKey(self: *Self, now: i64) ZimitError!void {
             if (now >= self.next_prune_ns) {
-                _ = self.pruneExpiredAt(now);
+                _ = try self.pruneExpiredAt(now);
             }
 
             const maximum = self.max_entries orelse return;
             if (self.store.count() >= maximum) return error.CapacityExceeded;
         }
 
-        fn pruneExpiredAt(self: *Self, now: i64) usize {
+        fn pruneExpiredAt(self: *Self, now: i64) ZimitError!usize {
             const timeout = self.idle_timeout_ns orelse return 0;
-            var removed: usize = 0;
-            self.next_prune_ns = std.math.maxInt(i64);
+            self.expired_keys.clearRetainingCapacity();
+
+            var next_prune_ns: i64 = std.math.maxInt(i64);
             var iterator = self.store.iterator();
 
             while (iterator.next()) |entry| {
                 const state = entry.value_ptr.*;
                 const idle_ns = @as(i128, now) - @as(i128, state.last_seen_ns);
                 if (state.tat > now or now < state.last_seen_ns or idle_ns < timeout) {
-                    self.schedulePrune(state);
+                    next_prune_ns = @min(
+                        next_prune_ns,
+                        pruneTime(state, timeout),
+                    );
                     continue;
                 }
 
-                const owned_key = entry.key_ptr.*;
-                self.store.removeByPtr(entry.key_ptr);
-                self.deinitKey(owned_key);
-                removed += 1;
+                try self.expired_keys.append(self.allocator, entry.key_ptr.*);
             }
 
+            // HashMap modifications invalidate live iterators in Zig 0.16.
+            // Remove entries only after the collection pass has ended.
+            for (self.expired_keys.items) |key| {
+                const entry = self.store.fetchRemove(key) orelse unreachable;
+                self.deinitKey(entry.key);
+            }
+
+            const removed = self.expired_keys.items.len;
+            self.expired_keys.clearRetainingCapacity();
+            self.next_prune_ns = next_prune_ns;
             return removed;
         }
 
         fn schedulePrune(self: *Self, state: State) void {
             const timeout = self.idle_timeout_ns orelse return;
+            self.next_prune_ns = @min(
+                self.next_prune_ns,
+                pruneTime(state, timeout),
+            );
+        }
+
+        fn pruneTime(state: State, timeout: i64) i64 {
             const idle_expiration = saturatingI64(
                 @as(i128, state.last_seen_ns) + @as(i128, timeout),
             );
-            const candidate = @max(state.tat, idle_expiration);
-            self.next_prune_ns = @min(self.next_prune_ns, candidate);
+            return @max(state.tat, idle_expiration);
         }
 
         fn cloneKey(self: *Self, key: K) std.mem.Allocator.Error!K {

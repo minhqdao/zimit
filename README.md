@@ -6,7 +6,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 
 - **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). It's lock-free and thread-safe.
 - **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
-- **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with `idle_timeout_ns` to bound memory and reclaim inactive, fully-drained keys.
+- **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with `idle_timeout_ns` to bound memory and reclaim inactive, fully-drained keys. Explicit `pruneExpired()` calls return an allocation error if pruning scratch space cannot be reserved.
 - **Blocking vs non-blocking:**
   - `allow()` → Immediate `Decision`; denied results carry a `std.Io.Duration`
   - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; larger batches are denied.
