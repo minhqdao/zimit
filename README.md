@@ -8,6 +8,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 - **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
 - **Blocking vs non-blocking:**
   - `allow()` → Immediate decision
+  - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; larger batches are denied.
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
 - **Clocks:**
   - `SystemClock` → Production (requires `std.process.Init.io`)

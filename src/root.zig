@@ -144,6 +144,7 @@ pub const GlobalLimiter = struct {
     }
 
     /// Atomically consume `n` slots.
+    /// A batch can contain at most `1 + burst` requests.
     pub fn allowN(self: *GlobalLimiter, n: u32) Outcome {
         return switch (self.inner.allowN(n)) {
             .allowed => .allowed,
@@ -217,7 +218,8 @@ pub fn RateLimiter(comptime K: type) type {
         /// Check whether `key` may make `n` requests atomically.
         ///
         /// All `n` slots are consumed together or none are — there is no
-        /// partial allowance. Useful for batch jobs or chunked uploads.
+        /// partial allowance. A batch can contain at most `1 + burst`
+        /// requests. Useful for batch jobs or chunked uploads.
         pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Outcome {
             return switch (try self.inner.checkKeyN(key, n)) {
                 .allowed => .allowed,
@@ -375,17 +377,27 @@ test "RateLimiter: burst — replenishes after delay" {
 test "RateLimiter: allowN — consume multiple slots atomically" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    // rate=10/s, no burst → 10 slots available at t=0
-    var lim = try makeLimiter(10, .second, 0, &mc);
+    // burst=6 → one base request plus six extra requests at once
+    var lim = try makeLimiter(10, .second, 6, &mc);
     defer lim.deinit();
 
     // Consume 7 — succeeds
     try std.testing.expectEqual(true, (try lim.allowN("u", 7)).isAllowed());
-    // Only 3 remain — requesting 4 fails
+    // The instantaneous capacity is exhausted — requesting 4 fails
     try std.testing.expectEqual(false, (try lim.allowN("u", 4)).isAllowed());
-    // 3 remaining still there — fails too, TAT is already 700ms out
-    // and no burst to cover the gap for a further n=3 at t=0
+    // No partial capacity is available for a further batch of 3
     try std.testing.expectEqual(false, (try lim.allowN("u", 3)).isAllowed());
+}
+
+test "RateLimiter: allowN — fresh limiter without burst denies batch" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try makeLimiter(10, .second, 0, &mc);
+    defer lim.deinit();
+
+    try std.testing.expect(!(try lim.allowN("u", 5)).isAllowed());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: allowN — n=0 always allowed without state change" {
@@ -406,7 +418,7 @@ test "RateLimiter: allowN — n=0 always allowed without state change" {
 test "RateLimiter: allowN — partial batch is never granted" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try makeLimiter(5, .second, 0, &mc);
+    var lim = try makeLimiter(5, .second, 4, &mc);
     defer lim.deinit();
 
     // Consume 3 slots atomically — succeeds, TAT now 600ms out
@@ -530,8 +542,8 @@ test "RateLimiter: allowN overflow guard does not mutate state" {
 test "RateLimiter: allowN large but valid n is evaluated normally" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
-    // rate=10/s → interval=100ms → max_batch=92, so n=5 is valid
-    var lim = try makeLimiter(10, .second, 0, &mc);
+    // burst=4 makes a batch of five admissible.
+    var lim = try makeLimiter(10, .second, 4, &mc);
     defer lim.deinit();
 
     const out = try lim.allowN("u", 5);
@@ -866,12 +878,26 @@ test "GlobalLimiter: allowN batch" {
     var lim = try GlobalLimiter.init(.{
         .rate = 10,
         .per = .second,
-        .burst = 0,
+        .burst = 7,
         .clock = mc.clock(),
     });
 
     try std.testing.expectEqual(true, lim.allowN(8).isAllowed());
     try std.testing.expectEqual(false, lim.allowN(4).isAllowed());
+}
+
+test "GlobalLimiter: allowN fresh limiter without burst denies batch" {
+    var mc = ManualClock{};
+    mc.set(std.time.ns_per_s);
+    var lim = try GlobalLimiter.init(.{
+        .rate = 10,
+        .per = .second,
+        .burst = 0,
+        .clock = mc.clock(),
+    });
+
+    try std.testing.expect(!lim.allowN(5).isAllowed());
+    try std.testing.expect(lim.allow().isAllowed());
 }
 
 test "GlobalLimiter: retryAfterMsCeil is non-zero on denial" {

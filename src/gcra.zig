@@ -30,8 +30,27 @@ pub fn check(
     emission_interval_ns: i64,
     burst_offset_ns: i64,
 ) Decision {
+    return checkN(tat, now_ns, emission_interval_ns, burst_offset_ns, 1);
+}
+
+/// Run one GCRA check for an atomic batch of `n` requests.
+///
+/// Eligibility is calculated using the base emission interval. The batch
+/// consumes `n` intervals when allowed, while the first request consumes the
+/// normal slot and the remaining `n - 1` requests consume burst capacity.
+fn checkN(
+    tat: i64,
+    now_ns: i64,
+    emission_interval_ns: i64,
+    burst_offset_ns: i64,
+    n: u32,
+) Decision {
+    std.debug.assert(n > 0);
+
+    const batch_interval_ns = emission_interval_ns * @as(i64, n);
+
     // The TAT we would assign if we allow this request.
-    const new_tat = @max(tat, now_ns) + emission_interval_ns;
+    const new_tat = @max(tat, now_ns) + batch_interval_ns;
 
     // The earliest `now` at which this request is valid, given the burst allowance.
     const allow_at = new_tat - burst_offset_ns - emission_interval_ns;
@@ -65,6 +84,7 @@ pub fn Limiter(comptime K: type) type {
         burst_offset_ns: i64,
         clock: Clock,
         max_batch: u64,
+        burst_capacity: u64,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -82,6 +102,7 @@ pub fn Limiter(comptime K: type) type {
                 .burst_offset_ns = limit.burstOffset(burst),
                 .clock = clock,
                 .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
+                .burst_capacity = @as(u64, burst) + 1,
             };
         }
 
@@ -109,20 +130,20 @@ pub fn Limiter(comptime K: type) type {
         pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
             if (n == 0) return .{ .allowed = .{ .new_tat = self.store.get(key) orelse 0 } };
 
-            if (@as(u64, n) > self.max_batch) {
+            if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
                 return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
             }
 
             const now = self.clock.now();
-            const scaled_interval = self.emission_interval_ns * @as(i64, n);
 
             // Only lookup — never trust existing key memory
             if (self.store.getEntry(key)) |entry| {
-                const decision = check(
+                const decision = checkN(
                     entry.value_ptr.*,
                     now,
-                    scaled_interval,
+                    self.emission_interval_ns,
                     self.burst_offset_ns,
+                    n,
                 );
 
                 if (decision == .allowed) {
@@ -132,11 +153,12 @@ pub fn Limiter(comptime K: type) type {
                 return decision;
             }
 
-            const decision = check(
+            const decision = checkN(
                 0,
                 now,
-                scaled_interval,
+                self.emission_interval_ns,
                 self.burst_offset_ns,
+                n,
             );
 
             if (decision == .allowed) {
@@ -199,6 +221,7 @@ pub const AtomicLimiter = struct {
     burst_offset_ns: i64,
     clock: Clock,
     max_batch: u64,
+    burst_capacity: u64,
 
     /// Initialise an atomic limiter.
     ///
@@ -217,6 +240,7 @@ pub const AtomicLimiter = struct {
             .burst_offset_ns = limit.burstOffset(burst),
             .clock = clock,
             .max_batch = @as(u64, @intCast(@divFloor(std.math.maxInt(i64), interval))),
+            .burst_capacity = @as(u64, burst) + 1,
         };
     }
 
@@ -233,22 +257,21 @@ pub const AtomicLimiter = struct {
             return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
         }
 
-        if (@as(u64, n) > self.max_batch) {
+        if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
             return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
         }
-
-        const scaled = self.emission_interval_ns * @as(i64, n);
 
         const now = self.clock.now();
 
         while (true) {
             const old_tat = self.tat.load(.monotonic);
 
-            const decision = check(
+            const decision = checkN(
                 old_tat,
                 now,
-                scaled,
+                self.emission_interval_ns,
                 self.burst_offset_ns,
+                n,
             );
 
             switch (decision) {
@@ -819,7 +842,7 @@ test "Limiter: checkKeyN denial does not change state" {
     var lim = try StringLimiter.init(
         std.testing.allocator,
         Limit.perSecond(5),
-        0,
+        4,
         mc.clock(),
     );
     defer lim.deinit();
@@ -962,11 +985,10 @@ test "Limiter: init rejects negative period" {
     try std.testing.expectError(error.InvalidLimit, result);
 }
 
-test "Limiter: batch on fresh key always allowed (TAT pushes forward)" {
+test "Limiter: batch on fresh key cannot exceed burst capacity" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    // rate=10/s, burst=2 → for fresh keys, any batch is allowed
-    // because allow_at = max(0, now) - burstOffset = now - burstOffset <= now
+    // burst=2 means one base request plus two extra requests at once.
     var lim = try StringLimiter.init(
         std.testing.allocator,
         Limit.perSecond(10),
@@ -975,12 +997,11 @@ test "Limiter: batch on fresh key always allowed (TAT pushes forward)" {
     );
     defer lim.deinit();
 
-    // Large batch on a fresh key — allowed, TAT pushed far forward
-    const d = try lim.checkKeyN("u", 8);
-    try std.testing.expect(d.isAllowed());
-    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+    try std.testing.expect(!(try lim.checkKeyN("u", 4)).isAllowed());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 
-    // Key is now exhausted — second request denied because TAT is far in future
+    try std.testing.expect((try lim.checkKeyN("u", 3)).isAllowed());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
     try std.testing.expect(!(try lim.checkKey("u")).isAllowed());
 }
 
@@ -1161,7 +1182,7 @@ test "AtomicLimiter: burst allows base+burst requests" {
 test "AtomicLimiter: allowN consumes slots atomically" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.perSecond(10), 0, mc.clock());
+    var lim = try AtomicLimiter.init(Limit.perSecond(10), 6, mc.clock());
 
     try std.testing.expect(lim.allowN(7).isAllowed());
     try std.testing.expect(!lim.allowN(4).isAllowed());
@@ -1181,7 +1202,7 @@ test "AtomicLimiter: allowN=0 always allowed, no state change" {
 test "AtomicLimiter: denied allowN leaves TAT unchanged" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.perSecond(5), 0, mc.clock());
+    var lim = try AtomicLimiter.init(Limit.perSecond(5), 2, mc.clock());
 
     try std.testing.expect(lim.allowN(3).isAllowed());
 
@@ -1298,7 +1319,7 @@ test "AtomicLimiter: allowN large but valid n still works" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
-    var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
+    var lim = try AtomicLimiter.init(Limit.perMinute(1), 99, mc.clock());
 
     const n: u32 = 100;
     try std.testing.expect(@as(u64, n) <= lim.max_batch);
@@ -1316,9 +1337,14 @@ test "AtomicLimiter: allowN large but valid n still works" {
 
 test "AtomicLimiter: allowN boundary exactly at max_batch does not overflow" {
     var mc = types.ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(0);
 
-    var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
+    const interval = @divFloor(std.math.maxInt(i64), 10);
+    var lim = try AtomicLimiter.init(
+        .{ .count = 1, .period_ns = interval },
+        9,
+        mc.clock(),
+    );
 
     const n: u32 = @intCast(lim.max_batch);
     const d = lim.allowN(n);
