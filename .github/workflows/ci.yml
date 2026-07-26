@@ -14,7 +14,24 @@ jobs:
             - uses: mlugg/setup-zig@v2
               with:
                   version: "0.16.0"
-            - run: zig fmt --check src/ build.zig
+            - run: zig fmt --check src/ examples/ build.zig
+
+    lint:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v7
+            - uses: mlugg/setup-zig@v2
+              with:
+                  version: "0.16.0"
+            - name: Install ZLS
+              run: |
+                  mkdir -p "${RUNNER_TEMP}/zls"
+                  curl --fail --location \
+                    "https://github.com/zigtools/zls/releases/download/0.16.0/zls-x86_64-linux.tar.xz" \
+                    | tar --extract --xz --directory "${RUNNER_TEMP}/zls"
+                  echo "${RUNNER_TEMP}/zls" >> "${GITHUB_PATH}"
+            - name: Run ZLS lint
+              run: python3 tools/zls_lint.py
 
     test:
         name: ${{ matrix.os }} - ${{ matrix.zig-version }}

@@ -9,8 +9,8 @@ const std = @import("std");
 /// Describes a rate: `count` requests allowed per `period` nanoseconds.
 ///
 /// Example:
-///     const limit = Limit.per_second(100);      // 100 req/s
-///     const limit = Limit.per_minute(1000);     // 1 000 req/min
+///     const limit = Limit.perSecond(100);      // 100 req/s
+///     const limit = Limit.perMinute(1000);     // 1 000 req/min
 ///     const limit = Limit{ .count = 5, .period_ns = 2 * std.time.ns_per_s }; // 5 req/2s
 pub const Limit = struct {
     /// Number of requests allowed per period.
@@ -20,30 +20,30 @@ pub const Limit = struct {
 
     /// Derived: nanoseconds between each emission (period / count).
     /// This is the fundamental GCRA unit — one "slot" of time.
-    pub fn emission_interval(self: Limit) i64 {
+    pub fn emissionInterval(self: Limit) i64 {
         return @divTrunc(self.period_ns, @as(i64, self.count));
     }
 
     /// Nanoseconds a burst of `burst` extra requests buys you.
     /// In GCRA terms: how far in the past the TAT may be before we reject.
-    pub fn burst_offset(self: Limit, burst: u32) i64 {
-        return self.emission_interval() * @as(i64, burst);
+    pub fn burstOffset(self: Limit, burst: u32) i64 {
+        return self.emissionInterval() * @as(i64, burst);
     }
 
     // ── Convenience constructors ────────────────────────────────────────────
 
     /// 1 request per second.
-    pub fn per_second(count: u32) Limit {
+    pub fn perSecond(count: u32) Limit {
         return .{ .count = count, .period_ns = std.time.ns_per_s };
     }
 
     /// 1 request per minute.
-    pub fn per_minute(count: u32) Limit {
+    pub fn perMinute(count: u32) Limit {
         return .{ .count = count, .period_ns = 60 * std.time.ns_per_s };
     }
 
     /// 1 request per hour.
-    pub fn per_hour(count: u32) Limit {
+    pub fn perHour(count: u32) Limit {
         return .{ .count = count, .period_ns = 3600 * std.time.ns_per_s };
     }
 };
@@ -62,12 +62,12 @@ pub const Decision = union(enum) {
     denied: struct { retry_after_ns: i64 },
 
     /// Returns true if the request was allowed.
-    pub fn is_allowed(self: Decision) bool {
+    pub fn isAllowed(self: Decision) bool {
         return self == .allowed;
     }
 
     /// Returns the retry delay in nanoseconds if denied, else null.
-    pub fn retry_after_ns(self: Decision) ?i64 {
+    pub fn retryAfterNs(self: Decision) ?i64 {
         return switch (self) {
             .denied => |d| d.retry_after_ns,
             .allowed => null,
@@ -102,10 +102,10 @@ pub const SystemClock = struct {
 
     /// Returns a generic `Clock` interface backed by this SystemClock.
     pub fn clock(self: *SystemClock) Clock {
-        return .{ .ptr = self, .now_fn = now_impl };
+        return .{ .ptr = self, .now_fn = nowImpl };
     }
 
-    fn now_impl(ptr: *anyopaque) i64 {
+    fn nowImpl(ptr: *anyopaque) i64 {
         const self: *SystemClock = @ptrCast(@alignCast(ptr));
         const ts = std.Io.Timestamp.now(self.io, .real);
         return @intCast(ts.toNanoseconds());
@@ -119,7 +119,7 @@ pub const ManualClock = struct {
 
     /// Returns a generic `Clock` interface backed by this ManualClock.
     pub fn clock(self: *ManualClock) Clock {
-        return .{ .ptr = self, .now_fn = now_impl };
+        return .{ .ptr = self, .now_fn = nowImpl };
     }
 
     /// Sets the clock to an absolute time in nanoseconds.
@@ -132,7 +132,7 @@ pub const ManualClock = struct {
         self.time_ns += ns;
     }
 
-    fn now_impl(ptr: *anyopaque) i64 {
+    fn nowImpl(ptr: *anyopaque) i64 {
         const self: *ManualClock = @ptrCast(@alignCast(ptr));
         return self.time_ns;
     }
@@ -153,70 +153,70 @@ pub const ZimitError = error{
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 
-test "Limit.emission_interval: 100 req/s → 10ms" {
-    const l = Limit.per_second(100);
-    try std.testing.expectEqual(@as(i64, 10_000_000), l.emission_interval());
+test "Limit.emissionInterval: 100 req/s → 10ms" {
+    const l = Limit.perSecond(100);
+    try std.testing.expectEqual(@as(i64, 10_000_000), l.emissionInterval());
 }
 
-test "Limit.emission_interval: 1 req/s → 1s" {
-    const l = Limit.per_second(1);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emission_interval());
+test "Limit.emissionInterval: 1 req/s → 1s" {
+    const l = Limit.perSecond(1);
+    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
 }
 
-test "Limit.burst_offset: 100 req/s burst=10 → 100ms" {
-    const l = Limit.per_second(100);
-    try std.testing.expectEqual(@as(i64, 100_000_000), l.burst_offset(10));
+test "Limit.burstOffset: 100 req/s burst=10 → 100ms" {
+    const l = Limit.perSecond(100);
+    try std.testing.expectEqual(@as(i64, 100_000_000), l.burstOffset(10));
 }
 
-test "Limit.burst_offset: no burst → 0" {
-    const l = Limit.per_second(50);
-    try std.testing.expectEqual(@as(i64, 0), l.burst_offset(0));
+test "Limit.burstOffset: no burst → 0" {
+    const l = Limit.perSecond(50);
+    try std.testing.expectEqual(@as(i64, 0), l.burstOffset(0));
 }
 
-test "Limit.per_minute: 60 req/min → 1s emission interval" {
-    const l = Limit.per_minute(60);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emission_interval());
+test "Limit.perMinute: 60 req/min → 1s emission interval" {
+    const l = Limit.perMinute(60);
+    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
 }
 
-test "Limit.per_hour: 3600 req/h → 1s emission interval" {
-    const l = Limit.per_hour(3600);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emission_interval());
+test "Limit.perHour: 3600 req/h → 1s emission interval" {
+    const l = Limit.perHour(3600);
+    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
 }
 
-test "Limit.per_hour: 1 req/h → 1 hour emission interval" {
-    const l = Limit.per_hour(1);
-    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), l.emission_interval());
+test "Limit.perHour: 1 req/h → 1 hour emission interval" {
+    const l = Limit.perHour(1);
+    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), l.emissionInterval());
 }
 
-test "Limit.emission_interval: large count does not overflow" {
+test "Limit.emissionInterval: large count does not overflow" {
     // maxInt(u32) = 4_294_967_295
     // period_ns = 1_000_000_000 (1s)
     // interval = 1_000_000_000 / 4_294_967_295 = 0 (integer truncation)
-    const l = Limit.per_second(std.math.maxInt(u32));
-    const interval = l.emission_interval();
+    const l = Limit.perSecond(std.math.maxInt(u32));
+    const interval = l.emissionInterval();
     try std.testing.expect(interval >= 0);
 }
 
-test "Limit.burst_offset: burst=maxInt(u32) with large interval does not panic" {
+test "Limit.burstOffset: burst=maxInt(u32) with large interval does not panic" {
     // 1 req/s → interval = 1_000_000_000
     // burst = 1 → offset = 1_000_000_000
-    const l = Limit.per_second(1);
-    const offset = l.burst_offset(1);
+    const l = Limit.perSecond(1);
+    const offset = l.burstOffset(1);
     try std.testing.expectEqual(std.time.ns_per_s, offset);
 }
 
-test "Decision.is_allowed" {
+test "Decision.isAllowed" {
     const allowed = Decision{ .allowed = .{ .new_tat = 42 } };
     const denied = Decision{ .denied = .{ .retry_after_ns = 1000 } };
-    try std.testing.expect(allowed.is_allowed());
-    try std.testing.expect(!denied.is_allowed());
+    try std.testing.expect(allowed.isAllowed());
+    try std.testing.expect(!denied.isAllowed());
 }
 
 test "Decision.retry_after_ns" {
     const allowed = Decision{ .allowed = .{ .new_tat = 0 } };
     const denied = Decision{ .denied = .{ .retry_after_ns = 5_000_000 } };
-    try std.testing.expectEqual(@as(?i64, null), allowed.retry_after_ns());
-    try std.testing.expectEqual(@as(?i64, 5_000_000), denied.retry_after_ns());
+    try std.testing.expectEqual(@as(?i64, null), allowed.retryAfterNs());
+    try std.testing.expectEqual(@as(?i64, 5_000_000), denied.retryAfterNs());
 }
 
 test "SystemClock: monotonic non-decreasing without sleep" {
@@ -297,12 +297,12 @@ test "ManualClock: set then tick combines correctly" {
     try std.testing.expectEqual(@as(i64, 7_000_000_000), c.clock().now());
 }
 
-test "Decision: allowed is_allowed returns true" {
+test "Decision: allowed isAllowed returns true" {
     const d = Decision{ .allowed = .{ .new_tat = 0 } };
-    try std.testing.expect(d.is_allowed());
+    try std.testing.expect(d.isAllowed());
 }
 
-test "Decision: denied is_allowed returns false" {
+test "Decision: denied isAllowed returns false" {
     const d = Decision{ .denied = .{ .retry_after_ns = 100 } };
-    try std.testing.expect(!d.is_allowed());
+    try std.testing.expect(!d.isAllowed());
 }
