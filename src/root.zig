@@ -331,8 +331,8 @@ fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
 
         /// Remove fully-drained keys whose idle timeout has elapsed.
         /// Returns the number of keys removed.
-        pub fn pruneExpired(self: *Self) usize {
-            return self.inner.pruneExpired();
+        pub fn pruneExpired(self: *Self) ZimitError!usize {
+            return try self.inner.pruneExpired();
         }
     };
 }
@@ -916,9 +916,60 @@ test "RateLimiter: pruneExpired removes all eligible keys" {
     _ = try lim.allow("c");
     mc.tick(std.time.ns_per_s);
 
-    try std.testing.expectEqual(@as(usize, 3), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 3), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
-    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
+}
+
+test "RateLimiter: pruneExpired safely removes many entries" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(128, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    var key_buffer: [32]u8 = undefined;
+    for (0..128) |i| {
+        const key = try std.fmt.bufPrint(&key_buffer, "key-{d}", .{i});
+        try std.testing.expect((try lim.allow(key)).isAllowed());
+    }
+
+    mc.tick(std.time.ns_per_s / 2);
+    for (0..128) |i| {
+        if (i % 2 != 0) continue;
+        const key = try std.fmt.bufPrint(&key_buffer, "key-{d}", .{i});
+        _ = try lim.allow(key);
+    }
+
+    mc.tick(std.time.ns_per_s / 2);
+    try std.testing.expectEqual(@as(usize, 64), try lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 64), lim.keyCount());
+
+    mc.tick(std.time.ns_per_s / 2);
+    try std.testing.expectEqual(@as(usize, 64), try lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+}
+
+test "RateLimiter: failed prune leaves entries intact" {
+    var mc = ManualClock{};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var lim = try StringRateLimiter.initWithClock(.{
+        .allocator = failing.allocator(),
+        .limit = .perSecond(1),
+        .max_entries = 2,
+        .idle_timeout_ns = std.time.ns_per_s,
+    }, mc.clock());
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    _ = try lim.allow("b");
+    mc.tick(std.time.ns_per_s);
+
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
+
+    failing.fail_index = std.math.maxInt(usize);
+    try std.testing.expectEqual(@as(usize, 2), try lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 }
 
 test "RateLimiter: pruneExpired preserves outstanding debt" {
@@ -934,11 +985,11 @@ test "RateLimiter: pruneExpired preserves outstanding debt" {
 
     try std.testing.expect((try lim.allowN("a", 3)).isAllowed());
     mc.tick(2 * std.time.ns_per_s);
-    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
 
     mc.tick(std.time.ns_per_s);
-    try std.testing.expectEqual(@as(usize, 1), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 1), try lim.pruneExpired());
 }
 
 test "RateLimiter: denied attempt refreshes idle timeout" {
@@ -951,10 +1002,10 @@ test "RateLimiter: denied attempt refreshes idle timeout" {
     try std.testing.expect(!(try lim.allow("a")).isAllowed());
 
     mc.tick(std.time.ns_per_s / 2);
-    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
 
     mc.tick(std.time.ns_per_s / 2);
-    try std.testing.expectEqual(@as(usize, 1), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 1), try lim.pruneExpired());
 }
 
 test "RateLimiter: pruneExpired ignores backward clock movement" {
@@ -966,7 +1017,7 @@ test "RateLimiter: pruneExpired ignores backward clock movement" {
     _ = try lim.allow("a");
     mc.set(0);
 
-    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
 }
 
