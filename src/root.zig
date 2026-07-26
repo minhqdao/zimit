@@ -140,13 +140,14 @@ pub const GlobalLimiter = struct {
     }
 
     /// Convenience for `allowN(1)`.
-    pub fn allow(self: *GlobalLimiter) Decision {
+    pub fn allow(self: *GlobalLimiter) ZimitError!Decision {
         return self.allowN(1);
     }
 
     /// Atomically consume `n` slots.
-    /// A batch can contain at most `1 + burst` requests.
-    pub fn allowN(self: *GlobalLimiter, n: u32) Decision {
+    /// Returns `error.BatchTooLarge` when `n` exceeds `1 + burst`, and
+    /// `error.TimeOverflow` when the resulting time cannot be represented.
+    pub fn allowN(self: *GlobalLimiter, n: u32) ZimitError!Decision {
         return self.inner.allowN(n);
     }
 
@@ -292,7 +293,9 @@ fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
         ///
         /// All `n` slots are consumed together or none are — there is no
         /// partial allowance. A batch can contain at most `1 + burst`
-        /// requests. Useful for batch jobs or chunked uploads.
+        /// requests; larger batches return `error.BatchTooLarge`. Returns
+        /// `error.TimeOverflow` when the resulting time cannot be represented.
+        /// Useful for batch jobs or chunked uploads.
         pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Decision {
             return self.inner.checkKeyN(key, n);
         }
@@ -420,7 +423,7 @@ test "production constructors remain valid after return by value" {
     var global_limiter = try makeProductionGlobalLimiter();
 
     try std.testing.expect((try rate_limiter.allow("u")).isAllowed());
-    try std.testing.expect(global_limiter.allow().isAllowed());
+    try std.testing.expect((try global_limiter.allow()).isAllowed());
 }
 
 test "RateLimiterWithContext supports borrowed keys and custom equality" {
@@ -602,13 +605,13 @@ test "RateLimiter: allowN — consume multiple slots atomically" {
     try std.testing.expectEqual(false, (try lim.allowN("u", 3)).isAllowed());
 }
 
-test "RateLimiter: allowN — fresh limiter without burst denies batch" {
+test "RateLimiter: allowN — fresh limiter without burst rejects batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(.perSecond(10), 0, &mc);
     defer lim.deinit();
 
-    try std.testing.expect(!(try lim.allowN("u", 5)).isAllowed());
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN("u", 5));
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
     try std.testing.expect((try lim.allow("u")).isAllowed());
 }
@@ -637,8 +640,8 @@ test "RateLimiter: allowN — partial batch is never granted" {
     // Consume 3 slots atomically — succeeds, TAT now 600ms out
     try std.testing.expectEqual(true, (try lim.allowN("u", 3)).isAllowed());
 
-    // Request 10 more — way over limit, must fail
-    try std.testing.expectEqual(false, (try lim.allowN("u", 10)).isAllowed());
+    // Request 10 more — impossible for this configuration, must fail
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN("u", 10));
 
     // Advance time by 600ms — exactly the 3 slots we consumed
     mc.tick(600 * std.time.ns_per_ms);
@@ -706,7 +709,7 @@ test "RateLimiter: integer key type (u64)" {
     try std.testing.expect((try lim.allow(1001)).isAllowed());
     try std.testing.expect((try lim.allow(1002)).isAllowed());
     // Same key, second request — denied
-    try std.testing.expect(!(try lim.allowN(1001, 5)).isAllowed());
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN(1001, 5));
 }
 
 test "RateLimiter: sustained throughput over simulated minute" {
@@ -725,7 +728,7 @@ test "RateLimiter: sustained throughput over simulated minute" {
     try std.testing.expectEqual(@as(usize, 6_000), allowed);
 }
 
-test "RateLimiter: allowN overflow guard denies without panic" {
+test "RateLimiter: allowN rejects an unrepresentable batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // per=minute, rate=1 → interval=60_000_000_000 ns → max_batch=153
@@ -733,36 +736,38 @@ test "RateLimiter: allowN overflow guard denies without panic" {
     var lim = try makeLimiter(.perMinute(1), 0, &mc);
     defer lim.deinit();
 
-    const out = try lim.allowN("u", std.math.maxInt(u32));
-    try std.testing.expect(!out.isAllowed());
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.allowN("u", std.math.maxInt(u32)),
+    );
 }
 
-test "RateLimiter: allowN overflow guard returns maxInt retry_after" {
+test "RateLimiter: rejected allowN does not mutate state" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(.perMinute(1), 0, &mc);
     defer lim.deinit();
 
-    const out = try lim.allowN("u", std.math.maxInt(u32));
-    switch (out) {
-        .denied => |d| try std.testing.expectEqual(
-            @as(i64, std.math.maxInt(i64)),
-            d.retry_after.toNanoseconds(),
-        ),
-        .allowed => return error.TestUnexpectedResult,
-    }
-}
-
-test "RateLimiter: allowN overflow guard does not mutate state" {
-    var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
-    var lim = try makeLimiter(.perMinute(1), 0, &mc);
-    defer lim.deinit();
-
-    _ = try lim.allowN("u", std.math.maxInt(u32));
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.allowN("u", std.math.maxInt(u32)),
+    );
 
     const out = try lim.allow("u");
     try std.testing.expect(out.isAllowed());
+}
+
+test "RateLimiter: unrepresentable admission returns TimeOverflow" {
+    var mc = ManualClock{};
+    mc.set(std.math.maxInt(i64) - 5);
+    var lim = try makeLimiter(.{
+        .count = 1,
+        .period_ns = 10,
+    }, 0, &mc);
+    defer lim.deinit();
+
+    try std.testing.expectError(error.TimeOverflow, lim.allow("u"));
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 }
 
 test "RateLimiter: allowN large but valid n is evaluated normally" {
@@ -1243,7 +1248,7 @@ test "GlobalLimiter: concurrent contention" {
 
         fn run(ctx: *@This()) void {
             while (true) {
-                if (ctx.limiter.allow().isAllowed()) {
+                if ((ctx.limiter.allow() catch unreachable).isAllowed()) {
                     _ = ctx.allowed.fetchAdd(1, .monotonic);
                 } else break;
             }
@@ -1274,9 +1279,9 @@ test "GlobalLimiter: basic allow and deny" {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expectEqual(true, lim.allow().isAllowed());
+        try std.testing.expectEqual(true, (try lim.allow()).isAllowed());
     }
-    try std.testing.expectEqual(false, lim.allow().isAllowed());
+    try std.testing.expectEqual(false, (try lim.allow()).isAllowed());
 }
 
 test "GlobalLimiter: arbitrary Limit period" {
@@ -1288,11 +1293,11 @@ test "GlobalLimiter: arbitrary Limit period" {
         },
     }, mc.clock());
 
-    try std.testing.expect(lim.allow().isAllowed());
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 
     mc.tick(std.time.ns_per_s / 4);
-    try std.testing.expect(lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
 }
 
 test "GlobalLimiter: reset restores capacity" {
@@ -1303,10 +1308,10 @@ test "GlobalLimiter: reset restores capacity" {
         .burst = 0,
     }, mc.clock());
 
-    _ = lim.allow();
-    try std.testing.expectEqual(false, lim.allow().isAllowed());
+    _ = try lim.allow();
+    try std.testing.expectEqual(false, (try lim.allow()).isAllowed());
     lim.reset();
-    try std.testing.expectEqual(true, lim.allow().isAllowed());
+    try std.testing.expectEqual(true, (try lim.allow()).isAllowed());
 }
 
 test "GlobalLimiter: wait blocks and eventually succeeds" {
@@ -1318,9 +1323,9 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     // Exhaust immediately
     var i: usize = 0;
     while (i < 10) : (i += 1) {
-        _ = lim.allow();
+        _ = try lim.allow();
     }
-    try std.testing.expectEqual(false, lim.allow().isAllowed());
+    try std.testing.expectEqual(false, (try lim.allow()).isAllowed());
 
     const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     try lim.wait(std.testing.io); // should block for roughly 100ms
@@ -1335,7 +1340,7 @@ test "GlobalLimiter: waitN blocks until the full batch is allowed" {
         .burst = 1,
     });
 
-    try std.testing.expect(lim.allowN(2).isAllowed());
+    try std.testing.expect((try lim.allowN(2)).isAllowed());
 
     const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     try lim.waitN(std.testing.io, 2);
@@ -1364,11 +1369,11 @@ test "GlobalLimiter: allowN batch" {
         .burst = 7,
     }, mc.clock());
 
-    try std.testing.expectEqual(true, lim.allowN(8).isAllowed());
-    try std.testing.expectEqual(false, lim.allowN(4).isAllowed());
+    try std.testing.expectEqual(true, (try lim.allowN(8)).isAllowed());
+    try std.testing.expectEqual(false, (try lim.allowN(4)).isAllowed());
 }
 
-test "GlobalLimiter: allowN fresh limiter without burst denies batch" {
+test "GlobalLimiter: allowN fresh limiter without burst rejects batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.initWithClock(.{
@@ -1376,8 +1381,8 @@ test "GlobalLimiter: allowN fresh limiter without burst denies batch" {
         .burst = 0,
     }, mc.clock());
 
-    try std.testing.expect(!lim.allowN(5).isAllowed());
-    try std.testing.expect(lim.allow().isAllowed());
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN(5));
+    try std.testing.expect((try lim.allow()).isAllowed());
 }
 
 test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
@@ -1388,8 +1393,8 @@ test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
         .burst = 0,
     }, mc.clock());
 
-    _ = lim.allow();
-    const decision = lim.allow();
+    _ = try lim.allow();
+    const decision = try lim.allow();
     switch (decision) {
         .denied => try std.testing.expect(
             decision.retryAfterMillisecondsCeil().? > 0,
@@ -1398,7 +1403,7 @@ test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
     }
 }
 
-test "GlobalLimiter: allowN overflow guard" {
+test "GlobalLimiter: allowN rejects an unrepresentable batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.initWithClock(.{
@@ -1406,18 +1411,13 @@ test "GlobalLimiter: allowN overflow guard" {
         .burst = 0,
     }, mc.clock());
 
-    const out = lim.allowN(std.math.maxInt(u32));
-    try std.testing.expect(!out.isAllowed());
-    switch (out) {
-        .denied => |d| try std.testing.expectEqual(
-            @as(i64, std.math.maxInt(i64)),
-            d.retry_after.toNanoseconds(),
-        ),
-        .allowed => return error.TestUnexpectedResult,
-    }
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.allowN(std.math.maxInt(u32)),
+    );
 }
 
-test "GlobalLimiter: allowN overflow guard does not mutate state" {
+test "GlobalLimiter: rejected allowN does not mutate state" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.initWithClock(.{
@@ -1425,9 +1425,25 @@ test "GlobalLimiter: allowN overflow guard does not mutate state" {
         .burst = 0,
     }, mc.clock());
 
-    _ = lim.allowN(std.math.maxInt(u32));
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.allowN(std.math.maxInt(u32)),
+    );
     // Normal request should still work
-    try std.testing.expect(lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
+}
+
+test "GlobalLimiter: unrepresentable admission returns TimeOverflow" {
+    var mc = ManualClock{};
+    mc.set(std.math.maxInt(i64) - 5);
+    var lim = try GlobalLimiter.initWithClock(.{
+        .limit = .{
+            .count = 1,
+            .period_ns = 10,
+        },
+    }, mc.clock());
+
+    try std.testing.expectError(error.TimeOverflow, lim.allow());
 }
 
 test "GlobalLimiter: init rejects unrepresentable burst duration" {

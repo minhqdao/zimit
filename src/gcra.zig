@@ -78,14 +78,16 @@ fn defaultOwnership(comptime K: type) KeyOwnership(K) {
 ///   emission_interval_ns  Nanoseconds per request slot (Limit.emissionInterval()).
 ///   burst_offset_ns  How far into the past the TAT may lag (Limit.burstOffset()).
 ///
-/// Returns a `Decision`. On `.allowed`, persist `decision.new_tat` back to
-/// your store. On `.denied`, wait `decision.retry_after` before retrying.
+/// Returns `error.TimeOverflow` when the resulting TAT or retry duration
+/// cannot be represented. Otherwise, on `.allowed`, persist
+/// `decision.new_tat` back to your store. On `.denied`, wait
+/// `decision.retry_after` before retrying.
 pub fn check(
     tat: i64,
     now_ns: i64,
     emission_interval_ns: i64,
     burst_offset_ns: i64,
-) Decision {
+) ZimitError!Decision {
     return checkN(tat, now_ns, emission_interval_ns, burst_offset_ns, 1);
 }
 
@@ -100,7 +102,7 @@ fn checkN(
     emission_interval_ns: i64,
     burst_offset_ns: i64,
     n: u32,
-) Decision {
+) ZimitError!Decision {
     std.debug.assert(n > 0);
 
     // Wider intermediates preserve the exact admission calculation even when
@@ -114,15 +116,13 @@ fn checkN(
     const allow_at = new_tat - @as(i128, burst_offset_ns) - @as(i128, emission_interval_ns);
 
     if (allow_at <= now_ns) {
-        if (new_tat > std.math.maxInt(i64) or new_tat < std.math.minInt(i64)) {
-            return .{ .denied = .{
-                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
-            } };
-        }
+        if (new_tat > std.math.maxInt(i64)) return error.TimeOverflow;
         return .{ .allowed = .{ .new_tat = @intCast(new_tat) } };
     } else {
+        const retry_after = allow_at - @as(i128, now_ns);
+        if (retry_after > std.math.maxInt(i64)) return error.TimeOverflow;
         return .{ .denied = .{ .retry_after = .fromNanoseconds(
-            saturatingI64(allow_at - @as(i128, now_ns)),
+            @intCast(retry_after),
         ) } };
     }
 }
@@ -167,13 +167,9 @@ const Engine = struct {
         if (!self.allowsBatch(n)) return error.BatchTooLarge;
     }
 
-    fn decide(self: Engine, tat: i64, now: i64, n: u32) Decision {
+    fn decide(self: Engine, tat: i64, now: i64, n: u32) ZimitError!Decision {
         if (n == 0) return .{ .allowed = .{ .new_tat = tat } };
-        if (!self.allowsBatch(n)) {
-            return .{ .denied = .{
-                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
-            } };
-        }
+        try self.validateBatch(n);
         return checkN(
             tat,
             now,
@@ -324,16 +320,16 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
             if (n == 0) {
                 const tat = if (self.store.get(key)) |state| state.tat else 0;
-                return self.engine.decide(tat, 0, n);
+                return try self.engine.decide(tat, 0, n);
             }
-            if (!self.engine.allowsBatch(n)) return self.engine.decide(0, 0, n);
+            try self.engine.validateBatch(n);
 
             const now = self.engine.clock.now();
 
             // Only lookup — never trust existing key memory
             if (self.store.getEntry(key)) |entry| {
                 entry.value_ptr.last_seen_ns = now;
-                const decision = self.engine.decide(
+                const decision = try self.engine.decide(
                     entry.value_ptr.tat,
                     now,
                     n,
@@ -346,7 +342,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
                 return decision;
             }
 
-            const decision = self.engine.decide(0, now, n);
+            const decision = try self.engine.decide(0, now, n);
 
             if (decision == .allowed) {
                 try self.maintainForNewKey(now);
@@ -507,23 +503,24 @@ pub const AtomicLimiter = struct {
 
     /// Check whether a single request is allowed right now.
     /// Safe to call from any number of threads simultaneously.
-    pub fn allow(self: *AtomicLimiter) Decision {
+    pub fn allow(self: *AtomicLimiter) ZimitError!Decision {
         return self.allowN(1);
     }
 
     /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
     /// are granted or none are — partial grants never occur.
-    pub fn allowN(self: *AtomicLimiter, n: u32) Decision {
-        if (n == 0 or !self.engine.allowsBatch(n)) {
-            return self.engine.decide(self.tat.load(.monotonic), 0, n);
+    pub fn allowN(self: *AtomicLimiter, n: u32) ZimitError!Decision {
+        if (n == 0) {
+            return try self.engine.decide(self.tat.load(.monotonic), 0, n);
         }
+        try self.engine.validateBatch(n);
 
         const now = self.engine.clock.now();
 
         while (true) {
             const old_tat = self.tat.load(.monotonic);
 
-            const decision = self.engine.decide(old_tat, now, n);
+            const decision = try self.engine.decide(old_tat, now, n);
 
             switch (decision) {
                 .denied => return decision,
@@ -561,41 +558,41 @@ pub const StringLimiter = Limiter([]const u8);
 
 test "check: fresh key is always allowed" {
     // tat=0, now=1s — any request on a fresh key must pass
-    const d = check(0, std.time.ns_per_s, 10_000_000, 0);
+    const d = try check(0, std.time.ns_per_s, 10_000_000, 0);
     try std.testing.expect(d.isAllowed());
 }
 
 test "check: new_tat advances by one emission interval" {
     const interval: i64 = 10_000_000; // 10ms
     const now: i64 = 1_000_000_000;
-    const d = check(0, now, interval, 0);
+    const d = try check(0, now, interval, 0);
     try std.testing.expectEqual(now + interval, d.allowed.new_tat);
 }
 
 test "check: second request inside interval is denied" {
     const interval: i64 = 10_000_000;
     const now: i64 = 1_000_000_000;
-    const first = check(0, now, interval, 0);
+    const first = try check(0, now, interval, 0);
     // Try again at the same instant — TAT is now in the future
-    const second = check(first.allowed.new_tat, now, interval, 0);
+    const second = try check(first.allowed.new_tat, now, interval, 0);
     try std.testing.expect(!second.isAllowed());
 }
 
 test "check: request exactly at next slot boundary is allowed" {
     const interval: i64 = 10_000_000;
     const now: i64 = 1_000_000_000;
-    const first = check(0, now, interval, 0);
+    const first = try check(0, now, interval, 0);
     // Advance time by exactly one emission interval
     const next_now = now + interval;
-    const second = check(first.allowed.new_tat, next_now, interval, 0);
+    const second = try check(first.allowed.new_tat, next_now, interval, 0);
     try std.testing.expect(second.isAllowed());
 }
 
 test "check: retry duration is accurate" {
     const interval: i64 = 10_000_000; // 10ms
     const now: i64 = 1_000_000_000;
-    const first = check(0, now, interval, 0);
-    const second = check(first.allowed.new_tat, now, interval, 0);
+    const first = try check(0, now, interval, 0);
+    const second = try check(first.allowed.new_tat, now, interval, 0);
     // Should need to wait ~10ms
     try std.testing.expectEqual(interval, second.denied.retry_after.toNanoseconds());
 }
@@ -609,13 +606,13 @@ test "check: burst=5 allows 6 requests at t=0" {
     // 1 base + 5 burst = 6 total
     var i: usize = 0;
     while (i < 6) : (i += 1) {
-        const d = check(tat, now, interval, burst_off);
+        const d = try check(tat, now, interval, burst_off);
         try std.testing.expect(d.isAllowed());
         tat = d.allowed.new_tat;
     }
 
     // 7th must be denied
-    const seventh = check(tat, now, interval, burst_off);
+    const seventh = try check(tat, now, interval, burst_off);
     try std.testing.expect(!seventh.isAllowed());
 }
 
@@ -628,14 +625,14 @@ test "check: burst replenishes over time" {
     // Exhaust burst (3 requests at t=0: 1 base + 2 burst)
     var i: usize = 0;
     while (i < 3) : (i += 1) {
-        const d = check(tat, now, interval, burst_off);
+        const d = try check(tat, now, interval, burst_off);
         tat = d.allowed.new_tat;
     }
-    try std.testing.expect(!check(tat, now, interval, burst_off).isAllowed());
+    try std.testing.expect(!(try check(tat, now, interval, burst_off)).isAllowed());
 
     // Advance by 2 intervals — should allow 2 requests again
     const later = now + 2 * interval;
-    const d = check(tat, later, interval, burst_off);
+    const d = try check(tat, later, interval, burst_off);
     try std.testing.expect(d.isAllowed());
 }
 
@@ -644,7 +641,7 @@ test "check: tat in the distant past behaves like a fresh key" {
     const now: i64 = 1_000_000_000_000; // 1000 seconds in
     // tat is 1 hour ago — should be treated as fully fresh
     const old_tat: i64 = now - 3_600 * std.time.ns_per_s;
-    const d = check(old_tat, now, interval, 0);
+    const d = try check(old_tat, now, interval, 0);
     try std.testing.expect(d.isAllowed());
     // new_tat should be based on now, not the ancient tat
     try std.testing.expectEqual(now + interval, d.allowed.new_tat);
@@ -659,7 +656,7 @@ test "check: zero burst, sustained rate allows exactly N req/s" {
     // Simulate 1 second with a request every 1ms (1000 attempts)
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        const d = check(tat, now, interval, 0);
+        const d = try check(tat, now, interval, 0);
         if (d.isAllowed()) {
             allowed += 1;
             tat = d.allowed.new_tat;
@@ -703,7 +700,7 @@ test "check: correctness under clock jitter" {
 
         if (delta > 0) forward_ns += delta;
 
-        const d = check(tat, now, interval, burst_off);
+        const d = try check(tat, now, interval, burst_off);
         if (d.isAllowed()) {
             allowed += 1;
             tat = d.allowed.new_tat;
@@ -720,7 +717,7 @@ test "check: correctness under clock jitter" {
 }
 
 test "check: now=0 (epoch) with fresh key is allowed" {
-    const d = check(0, 0, 10_000_000, 0);
+    const d = try check(0, 0, 10_000_000, 0);
     try std.testing.expect(d.isAllowed());
     // new_tat should be 0 + interval
     try std.testing.expectEqual(@as(i64, 10_000_000), d.allowed.new_tat);
@@ -731,7 +728,7 @@ test "check: tat already in the future queues behind it" {
     const now: i64 = 1_000_000_000;
     // TAT is 50ms in the future (5 slots ahead)
     const future_tat = now + 5 * interval;
-    const d = check(future_tat, now, interval, 5 * interval);
+    const d = try check(future_tat, now, interval, 5 * interval);
     // With burst=5, this should still be allowed (burstOffset covers 5 slots)
     try std.testing.expect(d.isAllowed());
     // new_tat should be future_tat + interval (queued behind existing TAT)
@@ -742,45 +739,39 @@ test "check: tat far in the future without burst is denied" {
     const interval: i64 = 10_000_000;
     const now: i64 = 1_000_000_000;
     const future_tat = now + 100 * interval; // 100 slots ahead
-    const d = check(future_tat, now, interval, 0);
+    const d = try check(future_tat, now, interval, 0);
     try std.testing.expect(!d.isAllowed());
 }
 
 test "check: unrepresentable new TAT fails closed" {
-    const d = check(
-        std.math.maxInt(i64) - 5,
-        std.math.maxInt(i64) - 5,
-        10,
-        0,
-    );
-
-    try std.testing.expect(!d.isAllowed());
-    try std.testing.expectEqual(
-        @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after.toNanoseconds(),
+    try std.testing.expectError(
+        error.TimeOverflow,
+        check(
+            std.math.maxInt(i64) - 5,
+            std.math.maxInt(i64) - 5,
+            10,
+            0,
+        ),
     );
 }
 
 test "check: allow_at subtraction cannot underflow" {
     const now = std.math.minInt(i64);
-    const d = check(now, now, 10, std.math.maxInt(i64));
+    const d = try check(now, now, 10, std.math.maxInt(i64));
 
     try std.testing.expect(d.isAllowed());
     try std.testing.expectEqual(now + 10, d.allowed.new_tat);
 }
 
-test "check: retry duration saturates instead of overflowing" {
-    const d = check(
-        std.math.maxInt(i64),
-        std.math.minInt(i64),
-        1,
-        0,
-    );
-
-    try std.testing.expect(!d.isAllowed());
-    try std.testing.expectEqual(
-        @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after.toNanoseconds(),
+test "check: unrepresentable retry duration returns TimeOverflow" {
+    try std.testing.expectError(
+        error.TimeOverflow,
+        check(
+            std.math.maxInt(i64),
+            std.math.minInt(i64),
+            1,
+            0,
+        ),
     );
 }
 
@@ -790,15 +781,15 @@ test "check: burstOffset exactly equal to interval allows 2 requests at same tim
     const now: i64 = 1_000_000_000;
 
     // First request
-    const d1 = check(0, now, interval, burst_off);
+    const d1 = try check(0, now, interval, burst_off);
     try std.testing.expect(d1.isAllowed());
 
     // Second request at same time — burst should cover it
-    const d2 = check(d1.allowed.new_tat, now, interval, burst_off);
+    const d2 = try check(d1.allowed.new_tat, now, interval, burst_off);
     try std.testing.expect(d2.isAllowed());
 
     // Third request — should be denied (only 1 burst slot)
-    const d3 = check(d2.allowed.new_tat, now, interval, burst_off);
+    const d3 = try check(d2.allowed.new_tat, now, interval, burst_off);
     try std.testing.expect(!d3.isAllowed());
 }
 
@@ -806,7 +797,7 @@ test "check: very large emissionInterval does not overflow" {
     // 1 req/hour → interval = 3_600_000_000_000
     const interval: i64 = 3_600_000_000_000;
     const now: i64 = 1_000_000_000;
-    const d = check(0, now, interval, 0);
+    const d = try check(0, now, interval, 0);
     try std.testing.expect(d.isAllowed());
     try std.testing.expectEqual(now + interval, d.allowed.new_tat);
 }
@@ -815,10 +806,10 @@ test "check: denied retry_after is exact gap" {
     const interval: i64 = 100_000_000; // 100ms
     const now: i64 = 1_000_000_000;
     // Consume first request
-    const d1 = check(0, now, interval, 0);
+    const d1 = try check(0, now, interval, 0);
     // Try again 30ms later — should be denied with ~70ms wait
     const later = now + 30_000_000;
-    const d2 = check(d1.allowed.new_tat, later, interval, 0);
+    const d2 = try check(d1.allowed.new_tat, later, interval, 0);
     try std.testing.expect(!d2.isAllowed());
     // retry_after should be (tat + interval - burstOffset - interval) - now = tat - now
     // tat = now + interval = 1_100_000_000, later = 1_030_000_000
@@ -1128,7 +1119,7 @@ test "Limiter: equal string content with different backing memory hits same key"
     try std.testing.expect(!d.isAllowed());
 }
 
-test "Limiter: checkKeyN denial does not change state" {
+test "Limiter: checkKeyN BatchTooLarge does not change state" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
@@ -1142,8 +1133,7 @@ test "Limiter: checkKeyN denial does not change state" {
 
     _ = try lim.checkKeyN("u", 3);
 
-    // This should fail
-    _ = try lim.checkKeyN("u", 10);
+    try std.testing.expectError(error.BatchTooLarge, lim.checkKeyN("u", 10));
 
     // Advance exactly 3 slots
     mc.tick(600 * std.time.ns_per_ms);
@@ -1218,7 +1208,7 @@ test "Limiter: freed key memory reuse does not corrupt map" {
     try std.testing.expect(!d.isAllowed());
 }
 
-test "Limiter: checkKeyN accepts maxInt(u32)" {
+test "Limiter: checkKeyN rejects maxInt(u32)" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
@@ -1230,11 +1220,10 @@ test "Limiter: checkKeyN accepts maxInt(u32)" {
     );
     defer lim.deinit();
 
-    const d = try lim.checkKeyN("u", std.math.maxInt(u32));
-
-    // Either allowed or denied depending on timing,
-    // but must NOT overflow or panic.
-    _ = d;
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.checkKeyN("u", std.math.maxInt(u32)),
+    );
 }
 
 test "Limiter: OutOfMemory handling" {
@@ -1303,7 +1292,7 @@ test "Limiter: batch on fresh key cannot exceed burst capacity" {
     );
     defer lim.deinit();
 
-    try std.testing.expect(!(try lim.checkKeyN("u", 4)).isAllowed());
+    try std.testing.expectError(error.BatchTooLarge, lim.checkKeyN("u", 4));
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 
     try std.testing.expect((try lim.checkKeyN("u", 3)).isAllowed());
@@ -1419,7 +1408,7 @@ test "Limiter: denied on existing key does not insert second key" {
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
 }
 
-test "Limiter: overflow guard denies fresh key without inserting" {
+test "Limiter: BatchTooLarge does not insert a fresh key" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     // perMinute(1) → interval=60e9 → max_batch=153 < maxInt(u32)
@@ -1431,9 +1420,11 @@ test "Limiter: overflow guard denies fresh key without inserting" {
     );
     defer lim.deinit();
 
-    // Overflow guard fires → denied before any store mutation
-    const d = try lim.checkKeyN("new", std.math.maxInt(u32));
-    try std.testing.expect(!d.isAllowed());
+    // Validation fails before any store mutation.
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.checkKeyN("new", std.math.maxInt(u32)),
+    );
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 }
 
@@ -1445,7 +1436,7 @@ test "AtomicLimiter: fresh limiter allows first request" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(10), 0, mc.clock());
-    const d = lim.allow();
+    const d = try lim.allow();
     try std.testing.expect(d.isAllowed());
 }
 
@@ -1454,10 +1445,10 @@ test "AtomicLimiter: exhausted limiter denies" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(3), 0, mc.clock());
 
-    _ = lim.allow();
-    _ = lim.allow();
-    _ = lim.allow();
-    try std.testing.expect(!lim.allow().isAllowed());
+    _ = try lim.allow();
+    _ = try lim.allow();
+    _ = try lim.allow();
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: time advance unblocks" {
@@ -1465,11 +1456,11 @@ test "AtomicLimiter: time advance unblocks" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
 
-    _ = lim.allow();
-    try std.testing.expect(!lim.allow().isAllowed());
+    _ = try lim.allow();
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 
     mc.tick(std.time.ns_per_s);
-    try std.testing.expect(lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: burst allows base+burst requests" {
@@ -1480,9 +1471,9 @@ test "AtomicLimiter: burst allows base+burst requests" {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expect(lim.allow().isAllowed());
+        try std.testing.expect((try lim.allow()).isAllowed());
     }
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: allowN consumes slots atomically" {
@@ -1490,8 +1481,8 @@ test "AtomicLimiter: allowN consumes slots atomically" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(10), 6, mc.clock());
 
-    try std.testing.expect(lim.allowN(7).isAllowed());
-    try std.testing.expect(!lim.allowN(4).isAllowed());
+    try std.testing.expect((try lim.allowN(7)).isAllowed());
+    try std.testing.expect(!(try lim.allowN(4)).isAllowed());
 }
 
 test "AtomicLimiter: allowN=0 always allowed, no state change" {
@@ -1499,10 +1490,10 @@ test "AtomicLimiter: allowN=0 always allowed, no state change" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
 
-    _ = lim.allow(); // exhaust
-    try std.testing.expect(!lim.allow().isAllowed());
-    try std.testing.expect(lim.allowN(0).isAllowed()); // zero never mutates
-    try std.testing.expect(!lim.allow().isAllowed()); // still exhausted
+    _ = try lim.allow(); // exhaust
+    try std.testing.expect(!(try lim.allow()).isAllowed());
+    try std.testing.expect((try lim.allowN(0)).isAllowed()); // zero never mutates
+    try std.testing.expect(!(try lim.allow()).isAllowed()); // still exhausted
 }
 
 test "AtomicLimiter: denied allowN leaves TAT unchanged" {
@@ -1510,10 +1501,10 @@ test "AtomicLimiter: denied allowN leaves TAT unchanged" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(5), 2, mc.clock());
 
-    try std.testing.expect(lim.allowN(3).isAllowed());
+    try std.testing.expect((try lim.allowN(3)).isAllowed());
 
     const tat_before = lim.tat.load(.monotonic);
-    _ = lim.allowN(10); // must fail
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN(10));
     const tat_after = lim.tat.load(.monotonic);
 
     // TAT must be bitwise identical — denied path must never write
@@ -1525,11 +1516,11 @@ test "AtomicLimiter: reset clears state" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
 
-    _ = lim.allow();
-    try std.testing.expect(!lim.allow().isAllowed());
+    _ = try lim.allow();
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 
     lim.reset();
-    try std.testing.expect(lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: retry duration is positive on denial" {
@@ -1537,8 +1528,8 @@ test "AtomicLimiter: retry duration is positive on denial" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
 
-    _ = lim.allow();
-    const d = lim.allow();
+    _ = try lim.allow();
+    const d = try lim.allow();
     switch (d) {
         .denied => |denied| try std.testing.expect(denied.retry_after.toNanoseconds() > 0),
         .allowed => return error.TestUnexpectedResult,
@@ -1572,13 +1563,13 @@ test "AtomicLimiter: sustained throughput matches rate" {
     // 10 seconds, one attempt every 1ms (10 000 attempts)
     while (t < 10 * std.time.ns_per_s) : (t += 1_000_000) {
         mc.set(t);
-        if (lim.allow().isAllowed()) allowed += 1;
+        if ((try lim.allow()).isAllowed()) allowed += 1;
     }
     // Expect exactly 1000 (100/s × 10s)
     try std.testing.expectEqual(@as(usize, 1000), allowed);
 }
 
-test "AtomicLimiter: allowN overflow guard denies without panic" {
+test "AtomicLimiter: allowN rejects an unrepresentable batch" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
 
@@ -1588,37 +1579,19 @@ test "AtomicLimiter: allowN overflow guard denies without panic" {
     if (lim.engine.max_batch >= std.math.maxInt(u32)) return; // avoid invalid cast
     const n: u32 = @intCast(lim.engine.max_batch + 1);
 
-    const d = lim.allowN(n);
-    try std.testing.expect(!d.isAllowed());
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN(n));
 }
 
-test "AtomicLimiter: allowN overflow guard leaves TAT unchanged" {
+test "AtomicLimiter: BatchTooLarge leaves TAT unchanged" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
 
     const tat_before = lim.tat.load(.monotonic);
     const n: u32 = @intCast(lim.engine.max_batch + 1);
-    _ = lim.allowN(n);
+    try std.testing.expectError(error.BatchTooLarge, lim.allowN(n));
 
     try std.testing.expectEqual(tat_before, lim.tat.load(.monotonic));
-}
-
-test "AtomicLimiter: allowN overflow guard returns maxInt retry_after" {
-    var mc = types.ManualClock{};
-    mc.set(std.time.ns_per_s);
-    var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
-
-    const n: u32 = @intCast(lim.engine.max_batch + 1);
-    const d = lim.allowN(n);
-
-    switch (d) {
-        .denied => |denied| try std.testing.expectEqual(
-            @as(i64, std.math.maxInt(i64)),
-            denied.retry_after.toNanoseconds(),
-        ),
-        .allowed => return error.TestUnexpectedResult,
-    }
 }
 
 test "AtomicLimiter: allowN large but valid n still works" {
@@ -1631,13 +1604,13 @@ test "AtomicLimiter: allowN large but valid n still works" {
     try std.testing.expect(@as(u64, n) <= lim.engine.max_batch);
 
     // First call always allowed on a cold limiter — consume capacity
-    _ = lim.allowN(n);
+    _ = try lim.allowN(n);
 
     // Now TAT is far in the future; a second batch must be denied
-    const d = lim.allowN(n);
+    const d = try lim.allowN(n);
 
     try std.testing.expect(!d.isAllowed());
-    // Finite wait — proves it was GCRA, not the overflow guard
+    // A real denial always carries a finite, meaningful wait.
     try std.testing.expect(d.denied.retry_after.toNanoseconds() < std.math.maxInt(i64));
 }
 
@@ -1653,7 +1626,7 @@ test "AtomicLimiter: allowN boundary exactly at max_batch does not overflow" {
     );
 
     const n: u32 = @intCast(lim.engine.max_batch);
-    const d = lim.allowN(n);
+    const d = try lim.allowN(n);
 
     // Guard must not have fired — if denied, retry must be finite
     switch (d) {
@@ -1694,12 +1667,7 @@ test "AtomicLimiter: unrepresentable future TAT fails closed" {
         mc.clock(),
     );
 
-    const d = lim.allow();
-    try std.testing.expect(!d.isAllowed());
-    try std.testing.expectEqual(
-        @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after.toNanoseconds(),
-    );
+    try std.testing.expectError(error.TimeOverflow, lim.allow());
     try std.testing.expectEqual(@as(i64, 0), lim.tat.load(.monotonic));
 }
 
@@ -1708,8 +1676,8 @@ test "AtomicLimiter: denial has finite retry_after (not overflow guard)" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
 
-    _ = lim.allow();
-    const d = lim.allow();
+    _ = try lim.allow();
+    const d = try lim.allow();
     switch (d) {
         .denied => |denied| {
             try std.testing.expect(denied.retry_after.toNanoseconds() > 0);
@@ -1730,17 +1698,17 @@ test "AtomicLimiter: reset then full capacity available" {
     // Exhaust all slots
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        _ = lim.allow();
+        _ = try lim.allow();
     }
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 
     // Reset and verify full capacity restored
     lim.reset();
     i = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expect(lim.allow().isAllowed());
+        try std.testing.expect((try lim.allow()).isAllowed());
     }
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: burst replenishes over time" {
@@ -1750,14 +1718,14 @@ test "AtomicLimiter: burst replenishes over time" {
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 1, mc.clock());
 
     // Use both slots
-    try std.testing.expect(lim.allow().isAllowed());
-    try std.testing.expect(lim.allow().isAllowed());
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 
     // Advance 1s → 1 slot replenished
     mc.tick(std.time.ns_per_s);
-    try std.testing.expect(lim.allow().isAllowed());
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect((try lim.allow()).isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 }
 
 test "AtomicLimiter: allowN with batch=2 on rate=10/s with burst" {
@@ -1769,9 +1737,9 @@ test "AtomicLimiter: allowN with batch=2 on rate=10/s with burst" {
     // 5 batches of 2 should exhaust 10 slots
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expect(lim.allowN(2).isAllowed());
+        try std.testing.expect((try lim.allowN(2)).isAllowed());
     }
-    try std.testing.expect(!lim.allow().isAllowed());
+    try std.testing.expect(!(try lim.allow()).isAllowed());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1804,7 +1772,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
         fn run(ctx: *@This()) void {
             var i: usize = 0;
             while (i < requests_per_thread) : (i += 1) {
-                if (ctx.limiter.allow().isAllowed()) {
+                if ((ctx.limiter.allow() catch unreachable).isAllowed()) {
                     _ = ctx.allowed.fetchAdd(1, .monotonic);
                 }
             }
@@ -1859,7 +1827,7 @@ test "AtomicLimiter: concurrent allows — no lost updates under contention" {
         fn run(ctx: *@This()) void {
             var i: usize = 0;
             while (i < requests_per_thread) : (i += 1) {
-                if (ctx.limiter.allow().isAllowed()) {
+                if ((ctx.limiter.allow() catch unreachable).isAllowed()) {
                     _ = ctx.allowed.fetchAdd(1, .monotonic);
                 }
             }
