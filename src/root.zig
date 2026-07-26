@@ -74,7 +74,7 @@ pub const RateLimiterConfig = struct {
     /// Remove fully-drained keys after this much inactivity.
     /// Expired keys are reclaimed when a new key is inserted or by calling
     /// `pruneExpired`.
-    idle_timeout_ns: ?i64 = null,
+    idle_timeout: ?std.Io.Duration = null,
 };
 
 /// Configuration for `GlobalLimiter.init`.
@@ -233,7 +233,7 @@ fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
                     .{
                         .initial_capacity = cfg.initial_capacity,
                         .max_entries = cfg.max_entries,
-                        .idle_timeout_ns = cfg.idle_timeout_ns,
+                        .idle_timeout = cfg.idle_timeout,
                     },
                 ),
             };
@@ -267,7 +267,7 @@ fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
                     .{
                         .initial_capacity = cfg.initial_capacity,
                         .max_entries = cfg.max_entries,
-                        .idle_timeout_ns = cfg.idle_timeout_ns,
+                        .idle_timeout = cfg.idle_timeout,
                     },
                     key_options.context,
                     key_options.ownership,
@@ -357,14 +357,14 @@ fn makeLimiter(limit: Limit, burst: u32, mc: *ManualClock) !StringRateLimiter {
 
 fn makeStoredLimiter(
     max_entries: ?usize,
-    idle_timeout_ns: ?i64,
+    idle_timeout: ?std.Io.Duration,
     mc: *ManualClock,
 ) !StringRateLimiter {
     return StringRateLimiter.initWithClock(.{
         .allocator = std.testing.allocator,
         .limit = .perSecond(1),
         .max_entries = max_entries,
-        .idle_timeout_ns = idle_timeout_ns,
+        .idle_timeout = idle_timeout,
     }, mc.clock());
 }
 
@@ -495,7 +495,7 @@ test "RateLimiterWithContext can own deeply copied keys" {
 
 test "RateLimiter: allow — fresh key passes" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(10), 0, &mc);
     defer lim.deinit();
 
@@ -505,7 +505,7 @@ test "RateLimiter: allow — fresh key passes" {
 
 test "RateLimiter: allow — exhausted key is denied" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(3), 0, &mc);
     defer lim.deinit();
 
@@ -518,7 +518,7 @@ test "RateLimiter: allow — exhausted key is denied" {
 
 test "RateLimiter: retryAfterMillisecondsCeil rounds up" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // 1 req/s → emission interval = 1 000 000 000 ns = 1000 ms
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
@@ -537,7 +537,7 @@ test "RateLimiter: retryAfterMillisecondsCeil rounds up" {
 
 test "RateLimiter: allow — keys are isolated" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -548,20 +548,20 @@ test "RateLimiter: allow — keys are isolated" {
 
 test "RateLimiter: allow — time advance unblocks key" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u");
     try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
     try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: burst — allows base+burst requests at t=0" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // rate=5/s, burst=3 → 1 base + 3 burst = 4 requests immediately
     var lim = try makeLimiter(.perSecond(5), 3, &mc);
     defer lim.deinit();
@@ -576,7 +576,7 @@ test "RateLimiter: burst — allows base+burst requests at t=0" {
 
 test "RateLimiter: burst — replenishes after delay" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 1, &mc);
     defer lim.deinit();
 
@@ -586,13 +586,13 @@ test "RateLimiter: burst — replenishes after delay" {
     try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // One second later, one slot has replenished
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
     try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: allowN — consume multiple slots atomically" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // burst=6 → one base request plus six extra requests at once
     var lim = try makeLimiter(.perSecond(10), 6, &mc);
     defer lim.deinit();
@@ -607,7 +607,7 @@ test "RateLimiter: allowN — consume multiple slots atomically" {
 
 test "RateLimiter: allowN — fresh limiter without burst rejects batch" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(10), 0, &mc);
     defer lim.deinit();
 
@@ -618,7 +618,7 @@ test "RateLimiter: allowN — fresh limiter without burst rejects batch" {
 
 test "RateLimiter: allowN — n=0 always allowed without state change" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -633,7 +633,7 @@ test "RateLimiter: allowN — n=0 always allowed without state change" {
 
 test "RateLimiter: allowN — partial batch is never granted" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(5), 4, &mc);
     defer lim.deinit();
 
@@ -644,7 +644,7 @@ test "RateLimiter: allowN — partial batch is never granted" {
     try std.testing.expectError(error.BatchTooLarge, lim.allowN("u", 10));
 
     // Advance time by 600ms — exactly the 3 slots we consumed
-    mc.tick(600 * std.time.ns_per_ms);
+    mc.tick(.fromNanoseconds(600 * std.time.ns_per_ms));
 
     // TAT is now at 1600ms, time is at 1600ms — key is fresh again.
     // If allowN had partially mutated state on the failed n=10 attempt,
@@ -654,7 +654,7 @@ test "RateLimiter: allowN — partial batch is never granted" {
 
 test "RateLimiter: remove — resets key to fresh" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -668,7 +668,7 @@ test "RateLimiter: remove — resets key to fresh" {
 
 test "RateLimiter: per minute config" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perMinute(60), 0, &mc);
     defer lim.deinit();
 
@@ -677,7 +677,7 @@ test "RateLimiter: per minute config" {
     try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // Advance 1 second → allowed again
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
     try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
@@ -685,20 +685,31 @@ test "RateLimiter: arbitrary Limit period" {
     var mc = ManualClock{};
     var lim = try makeLimiter(.{
         .count = 2,
-        .period_ns = std.time.ns_per_s / 2,
+        .period = .fromNanoseconds(std.time.ns_per_s / 2),
     }, 0, &mc);
     defer lim.deinit();
 
     try std.testing.expect((try lim.allow("u")).isAllowed());
     try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
-    mc.tick(std.time.ns_per_s / 4);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 4));
     try std.testing.expect((try lim.allow("u")).isAllowed());
+}
+
+test "RateLimiter: period outside internal range returns TimeOverflow" {
+    var mc = ManualClock{};
+    try std.testing.expectError(
+        error.TimeOverflow,
+        makeLimiter(.{
+            .count = 1,
+            .period = .max,
+        }, 0, &mc),
+    );
 }
 
 test "RateLimiter: integer key type (u64)" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try RateLimiter(u64).initWithClock(.{
         .allocator = std.testing.allocator,
         .limit = .perSecond(5),
@@ -721,7 +732,7 @@ test "RateLimiter: sustained throughput over simulated minute" {
     var t: i64 = 0;
     // 60 seconds, one attempt every 5ms (12 000 attempts total)
     while (t < 60 * std.time.ns_per_s) : (t += 5_000_000) {
-        mc.set(t);
+        mc.set(.fromNanoseconds(t));
         if ((try lim.allow("u")).isAllowed()) allowed += 1;
     }
     // Expect exactly 6 000 allowed (100/s × 60s)
@@ -730,7 +741,7 @@ test "RateLimiter: sustained throughput over simulated minute" {
 
 test "RateLimiter: allowN rejects an unrepresentable batch" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // per=minute, rate=1 → interval=60_000_000_000 ns → max_batch=153
     // maxInt(u32)=4_294_967_295 >> 153, so guard fires
     var lim = try makeLimiter(.perMinute(1), 0, &mc);
@@ -744,7 +755,7 @@ test "RateLimiter: allowN rejects an unrepresentable batch" {
 
 test "RateLimiter: rejected allowN does not mutate state" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perMinute(1), 0, &mc);
     defer lim.deinit();
 
@@ -759,10 +770,10 @@ test "RateLimiter: rejected allowN does not mutate state" {
 
 test "RateLimiter: unrepresentable admission returns TimeOverflow" {
     var mc = ManualClock{};
-    mc.set(std.math.maxInt(i64) - 5);
+    mc.set(.fromNanoseconds(std.math.maxInt(i64) - 5));
     var lim = try makeLimiter(.{
         .count = 1,
-        .period_ns = 10,
+        .period = .fromNanoseconds(10),
     }, 0, &mc);
     defer lim.deinit();
 
@@ -772,7 +783,7 @@ test "RateLimiter: unrepresentable admission returns TimeOverflow" {
 
 test "RateLimiter: allowN large but valid n is evaluated normally" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // burst=4 makes a batch of five admissible.
     var lim = try makeLimiter(.perSecond(10), 4, &mc);
     defer lim.deinit();
@@ -786,7 +797,7 @@ test "RateLimiter: allowN large but valid n is evaluated normally" {
 
 test "RateLimiter: allowN — n=1 and allow are equivalent" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim_a = try makeLimiter(.perSecond(5), 0, &mc);
     defer lim_a.deinit();
     var lim_b = try makeLimiter(.perSecond(5), 0, &mc);
@@ -802,7 +813,7 @@ test "RateLimiter: allowN — n=1 and allow are equivalent" {
 
 test "RateLimiter: remove on absent key is safe" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(5), 0, &mc);
     defer lim.deinit();
 
@@ -812,7 +823,7 @@ test "RateLimiter: remove on absent key is safe" {
 
 test "RateLimiter: keyCount after mixed allow and remove" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(10), 0, &mc);
     defer lim.deinit();
 
@@ -888,11 +899,11 @@ test "RateLimiter: max_entries zero rejects every new key" {
 
 test "RateLimiter: capacity automatically reclaims expired key" {
     var mc = ManualClock{};
-    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    var lim = try makeStoredLimiter(1, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     _ = try lim.allow("a");
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
 
     try std.testing.expect((try lim.allow("b")).isAllowed());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
@@ -901,11 +912,11 @@ test "RateLimiter: capacity automatically reclaims expired key" {
 
 test "RateLimiter: new key opportunistically reclaims expired entries" {
     var mc = ManualClock{};
-    var lim = try makeStoredLimiter(3, std.time.ns_per_s, &mc);
+    var lim = try makeStoredLimiter(3, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     _ = try lim.allow("a");
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
 
     try std.testing.expect((try lim.allow("b")).isAllowed());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
@@ -913,13 +924,13 @@ test "RateLimiter: new key opportunistically reclaims expired entries" {
 
 test "RateLimiter: pruneExpired removes all eligible keys" {
     var mc = ManualClock{};
-    var lim = try makeStoredLimiter(5, std.time.ns_per_s, &mc);
+    var lim = try makeStoredLimiter(5, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     _ = try lim.allow("a");
     _ = try lim.allow("b");
     _ = try lim.allow("c");
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
 
     try std.testing.expectEqual(@as(usize, 3), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
@@ -928,7 +939,7 @@ test "RateLimiter: pruneExpired removes all eligible keys" {
 
 test "RateLimiter: pruneExpired safely removes many entries" {
     var mc = ManualClock{};
-    var lim = try makeStoredLimiter(128, std.time.ns_per_s, &mc);
+    var lim = try makeStoredLimiter(128, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     var key_buffer: [32]u8 = undefined;
@@ -937,18 +948,18 @@ test "RateLimiter: pruneExpired safely removes many entries" {
         try std.testing.expect((try lim.allow(key)).isAllowed());
     }
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     for (0..128) |i| {
         if (i % 2 != 0) continue;
         const key = try std.fmt.bufPrint(&key_buffer, "key-{d}", .{i});
         _ = try lim.allow(key);
     }
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     try std.testing.expectEqual(@as(usize, 64), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 64), lim.keyCount());
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     try std.testing.expectEqual(@as(usize, 64), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 }
@@ -960,13 +971,13 @@ test "RateLimiter: failed prune leaves entries intact" {
         .allocator = failing.allocator(),
         .limit = .perSecond(1),
         .max_entries = 2,
-        .idle_timeout_ns = std.time.ns_per_s,
+        .idle_timeout = .fromNanoseconds(std.time.ns_per_s),
     }, mc.clock());
     defer lim.deinit();
 
     _ = try lim.allow("a");
     _ = try lim.allow("b");
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
 
     failing.fail_index = failing.alloc_index;
     try std.testing.expectError(error.OutOfMemory, lim.pruneExpired());
@@ -984,43 +995,43 @@ test "RateLimiter: pruneExpired preserves outstanding debt" {
         .limit = .perSecond(1),
         .burst = 2,
         .max_entries = 1,
-        .idle_timeout_ns = std.time.ns_per_s,
+        .idle_timeout = .fromNanoseconds(std.time.ns_per_s),
     }, mc.clock());
     defer lim.deinit();
 
     try std.testing.expect((try lim.allowN("a", 3)).isAllowed());
-    mc.tick(2 * std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(2 * std.time.ns_per_s));
     try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
 
-    mc.tick(std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s));
     try std.testing.expectEqual(@as(usize, 1), try lim.pruneExpired());
 }
 
 test "RateLimiter: denied attempt refreshes idle timeout" {
     var mc = ManualClock{};
-    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    var lim = try makeStoredLimiter(1, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     _ = try lim.allow("a");
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     try std.testing.expect(!(try lim.allow("a")).isAllowed());
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
     try std.testing.expectEqual(@as(usize, 1), try lim.pruneExpired());
 }
 
 test "RateLimiter: pruneExpired ignores backward clock movement" {
     var mc = ManualClock{};
-    mc.set(10 * std.time.ns_per_s);
-    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    mc.set(.fromNanoseconds(10 * std.time.ns_per_s));
+    var lim = try makeStoredLimiter(1, .fromSeconds(1), &mc);
     defer lim.deinit();
 
     _ = try lim.allow("a");
-    mc.set(0);
+    mc.set(.fromNanoseconds(0));
 
     try std.testing.expectEqual(@as(usize, 0), try lim.pruneExpired());
     try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
@@ -1030,17 +1041,25 @@ test "RateLimiter: init rejects non-positive idle timeout" {
     var mc = ManualClock{};
     try std.testing.expectError(
         error.InvalidIdleTimeout,
-        makeStoredLimiter(1, 0, &mc),
+        makeStoredLimiter(1, .zero, &mc),
     );
     try std.testing.expectError(
         error.InvalidIdleTimeout,
-        makeStoredLimiter(1, -1, &mc),
+        makeStoredLimiter(1, .fromNanoseconds(-1), &mc),
+    );
+}
+
+test "RateLimiter: idle timeout outside internal range returns TimeOverflow" {
+    var mc = ManualClock{};
+    try std.testing.expectError(
+        error.TimeOverflow,
+        makeStoredLimiter(1, .max, &mc),
     );
 }
 
 test "RateLimiter: retry duration is positive on denial" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -1054,7 +1073,7 @@ test "RateLimiter: retry duration is positive on denial" {
 
 test "RateLimiter: retry duration decreases as time advances" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -1066,7 +1085,7 @@ test "RateLimiter: retry duration decreases as time advances" {
         .allowed => return error.TestUnexpectedResult,
     };
 
-    mc.tick(std.time.ns_per_s / 2);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 2));
 
     const out2 = try lim.allow("u");
     const wait2 = switch (out2) {
@@ -1170,7 +1189,7 @@ test "RateLimiter: init rejects rate > 1 req/ns" {
 
 test "RateLimiter: per-hour config with burst and time advance" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     // 1 req/hour, burst=1 → 2 immediate requests
     var lim = try StringRateLimiter.initWithClock(.{
         .allocator = std.testing.allocator,
@@ -1186,13 +1205,13 @@ test "RateLimiter: per-hour config with burst and time advance" {
     try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // Advance 1 hour → 1 slot replenished
-    mc.tick(3600 * std.time.ns_per_s);
+    mc.tick(.fromNanoseconds(3600 * std.time.ns_per_s));
     try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: allowN with n=0 on exhausted key returns allowed" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
     defer lim.deinit();
 
@@ -1203,7 +1222,7 @@ test "RateLimiter: allowN with n=0 on exhausted key returns allowed" {
 
 test "RateLimiter: multiple keys with different burst behavior" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try makeLimiter(.perSecond(1), 2, &mc);
     defer lim.deinit();
 
@@ -1222,7 +1241,7 @@ test "RateLimiter: multiple keys with different burst behavior" {
 
 test "RateLimiter: StringRateLimiter type alias works" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try StringRateLimiter.initWithClock(.{
         .allocator = std.testing.allocator,
         .limit = .perSecond(5),
@@ -1271,7 +1290,7 @@ test "GlobalLimiter: concurrent contention" {
 
 test "GlobalLimiter: basic allow and deny" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perSecond(5),
         .burst = 4, // 1 base + 4 burst = 5
@@ -1289,20 +1308,20 @@ test "GlobalLimiter: arbitrary Limit period" {
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .{
             .count = 2,
-            .period_ns = std.time.ns_per_s / 2,
+            .period = .fromNanoseconds(std.time.ns_per_s / 2),
         },
     }, mc.clock());
 
     try std.testing.expect((try lim.allow()).isAllowed());
     try std.testing.expect(!(try lim.allow()).isAllowed());
 
-    mc.tick(std.time.ns_per_s / 4);
+    mc.tick(.fromNanoseconds(std.time.ns_per_s / 4));
     try std.testing.expect((try lim.allow()).isAllowed());
 }
 
 test "GlobalLimiter: reset restores capacity" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perSecond(1),
         .burst = 0,
@@ -1363,7 +1382,7 @@ test "GlobalLimiter: waitN rejects an impossible batch" {
 
 test "GlobalLimiter: allowN batch" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perSecond(10),
         .burst = 7,
@@ -1375,7 +1394,7 @@ test "GlobalLimiter: allowN batch" {
 
 test "GlobalLimiter: allowN fresh limiter without burst rejects batch" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perSecond(10),
         .burst = 0,
@@ -1387,7 +1406,7 @@ test "GlobalLimiter: allowN fresh limiter without burst rejects batch" {
 
 test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perSecond(1),
         .burst = 0,
@@ -1405,7 +1424,7 @@ test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
 
 test "GlobalLimiter: allowN rejects an unrepresentable batch" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perMinute(1),
         .burst = 0,
@@ -1419,7 +1438,7 @@ test "GlobalLimiter: allowN rejects an unrepresentable batch" {
 
 test "GlobalLimiter: rejected allowN does not mutate state" {
     var mc = ManualClock{};
-    mc.set(std.time.ns_per_s);
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .perMinute(1),
         .burst = 0,
@@ -1435,11 +1454,11 @@ test "GlobalLimiter: rejected allowN does not mutate state" {
 
 test "GlobalLimiter: unrepresentable admission returns TimeOverflow" {
     var mc = ManualClock{};
-    mc.set(std.math.maxInt(i64) - 5);
+    mc.set(.fromNanoseconds(std.math.maxInt(i64) - 5));
     var lim = try GlobalLimiter.initWithClock(.{
         .limit = .{
             .count = 1,
-            .period_ns = 10,
+            .period = .fromNanoseconds(10),
         },
     }, mc.clock());
 

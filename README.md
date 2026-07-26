@@ -6,7 +6,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 
 - **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). It's lock-free and thread-safe.
 - **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
-- **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with `idle_timeout_ns` to bound memory and reclaim inactive, fully-drained keys. Explicit `pruneExpired()` calls return an allocation error if pruning scratch space cannot be reserved.
+- **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with an `idle_timeout` duration to bound memory and reclaim inactive, fully-drained keys. Explicit `pruneExpired()` calls return an allocation error if pruning scratch space cannot be reserved.
 - **Blocking vs non-blocking:**
   - `allow()` → Immediate `Decision`; `.allowed` has no payload, while denied results carry a `std.Io.Duration`
   - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; impossible batches return `error.BatchTooLarge`.
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !void {
 
 Use `Limit.perSecond`, `Limit.perMinute`, or `Limit.perHour` for common rates.
 For an arbitrary period, initialize `Limit` directly with `count` and
-`period_ns`.
+`period`, for example `.{ .count = 5, .period = .fromSeconds(2) }`.
 
 See [examples](examples) for more.
 
