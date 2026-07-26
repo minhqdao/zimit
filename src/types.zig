@@ -89,7 +89,10 @@ pub const Clock = struct {
     }
 };
 
-/// Reads the real system monotonic clock.
+/// Reads the system's monotonic awake clock.
+///
+/// This clock cannot be adjusted like wall time and excludes time while the
+/// system is suspended. It uses the same clock as limiter wait operations.
 pub const SystemClock = struct {
     io: std.Io,
 
@@ -107,7 +110,7 @@ pub const SystemClock = struct {
 
     fn nowImpl(ptr: *anyopaque) i64 {
         const self: *SystemClock = @ptrCast(@alignCast(ptr));
-        const ts = std.Io.Timestamp.now(self.io, .real);
+        const ts = std.Io.Clock.awake.now(self.io);
         return @intCast(ts.toNanoseconds());
     }
 };
@@ -231,6 +234,18 @@ test "SystemClock: monotonic non-decreasing without sleep" {
         try std.testing.expect(now >= prev);
         prev = now;
     }
+}
+
+test "SystemClock: uses the awake monotonic clock" {
+    var sys = SystemClock.init(std.testing.io);
+    const clk = sys.clock();
+
+    const before = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+    const actual = clk.now();
+    const after = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
+
+    try std.testing.expect(actual >= before);
+    try std.testing.expect(actual <= after);
 }
 
 test "SystemClock: returns positive i64" {

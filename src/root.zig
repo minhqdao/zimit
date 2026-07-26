@@ -159,7 +159,7 @@ pub const GlobalLimiter = struct {
         while (true) {
             switch (self.allow()) {
                 .allowed => return,
-                .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
+                .denied => |d| try io.sleep(.fromNanoseconds(d.retry_after_ns), .awake),
             }
         }
     }
@@ -236,7 +236,7 @@ pub fn RateLimiter(comptime K: type) type {
                 const outcome = try self.allow(key);
                 switch (outcome) {
                     .allowed => return,
-                    .denied => |d| try std.Io.sleep(io, std.Io.Duration.fromNanoseconds(d.retry_after_ns), .awake),
+                    .denied => |d| try io.sleep(.fromNanoseconds(d.retry_after_ns), .awake),
                 }
             }
         }
@@ -652,9 +652,9 @@ test "RateLimiter: wait blocks and succeeds" {
         _ = try lim.allow(42);
     }
 
-    const start = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     try lim.wait(std.testing.io, 42);
-    const end = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    const end = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
 
     try std.testing.expect(end - start >= 50);
 }
@@ -865,9 +865,9 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     }
     try std.testing.expectEqual(false, lim.allow().isAllowed());
 
-    const start = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
     try lim.wait(std.testing.io); // should block for roughly 100ms
-    const end = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
+    const end = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
 
     try std.testing.expect(end - start >= 50); // allow some slack
 }
