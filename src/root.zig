@@ -47,6 +47,14 @@ pub const Clock = types.Clock;
 pub const SystemClock = types.SystemClock;
 pub const ManualClock = types.ManualClock;
 pub const ZimitError = types.ZimitError;
+pub const KeyOwnership = gcra.KeyOwnership;
+
+pub fn KeyOptions(comptime K: type, comptime Context: type) type {
+    return struct {
+        context: Context,
+        ownership: KeyOwnership(K),
+    };
+}
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -167,9 +175,11 @@ pub const GlobalLimiter = struct {
 
 /// A token-bucket-flavored rate limiter backed by a GCRA engine.
 ///
-/// `K` is the key type — typically `[]const u8` (IP, username) or an integer
-/// (user ID, session ID). All keys are isolated; one key's limit does not
-/// affect another's.
+/// `K` may be `[]const u8`, an integer, enum, or another type supported by
+/// `std.hash_map.AutoContext`. String keys are copied; other key values are
+/// stored directly and any memory they reference remains caller-owned.
+///
+/// For custom equality, hashing, or ownership, use `RateLimiterWithContext`.
 ///
 /// ### Thread Safety
 /// This type is **not** thread-safe. If you need to use the same `RateLimiter`
@@ -177,9 +187,21 @@ pub const GlobalLimiter = struct {
 ///
 /// For a thread-safe global limiter that doesn't require keys, see `GlobalLimiter`.
 pub fn RateLimiter(comptime K: type) type {
+    return RateLimiterImpl(K, gcra.DefaultContext(K));
+}
+
+/// A keyed limiter using a caller-provided `std.HashMap` context.
+///
+/// Initialise with `initWithKeyOptions` or `initWithClockAndKeyOptions` and
+/// explicitly select borrowed or owned key storage.
+pub fn RateLimiterWithContext(comptime K: type, comptime Context: type) type {
+    return RateLimiterImpl(K, Context);
+}
+
+fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
     return struct {
         const Self = @This();
-        const Inner = gcra.Limiter(K);
+        const Inner = gcra.LimiterWithContext(K, Context);
         const WaitContext = struct {
             limiter: *Self,
             key: K,
@@ -189,12 +211,20 @@ pub fn RateLimiter(comptime K: type) type {
 
         /// Initialise a production limiter using Zig's monotonic awake clock.
         pub fn init(io: std.Io, cfg: RateLimiterConfig) ZimitError!Self {
+            if (Context != gcra.DefaultContext(K)) {
+                @compileError("custom contexts must use initWithKeyOptions");
+            }
             return initWithClock(cfg, .{ .system = io });
         }
 
         /// Initialise with an explicit clock, typically for deterministic tests.
         /// The clock's backing object must outlive the limiter.
         pub fn initWithClock(cfg: RateLimiterConfig, clock: Clock) ZimitError!Self {
+            if (Context != gcra.DefaultContext(K)) {
+                @compileError(
+                    "custom contexts must use initWithClockAndKeyOptions",
+                );
+            }
             return .{
                 .inner = try Inner.initWithConfigAndStorage(
                     cfg.allocator,
@@ -204,6 +234,42 @@ pub fn RateLimiter(comptime K: type) type {
                         .max_entries = cfg.max_entries,
                         .idle_timeout_ns = cfg.idle_timeout_ns,
                     },
+                ),
+            };
+        }
+
+        /// Initialise a production limiter with explicit hashing and ownership.
+        pub fn initWithKeyOptions(
+            io: std.Io,
+            cfg: RateLimiterConfig,
+            key_options: KeyOptions(K, Context),
+        ) ZimitError!Self {
+            return initWithClockAndKeyOptions(
+                cfg,
+                .{ .system = io },
+                key_options,
+            );
+        }
+
+        /// Initialise with explicit clock, hashing, and ownership.
+        /// Borrowed key memory must stay alive and hash-equivalent while stored;
+        /// the clock backing object must outlive the limiter.
+        pub fn initWithClockAndKeyOptions(
+            cfg: RateLimiterConfig,
+            clock: Clock,
+            key_options: KeyOptions(K, Context),
+        ) ZimitError!Self {
+            return .{
+                .inner = try Inner.initWithKeyOptions(
+                    cfg.allocator,
+                    engineConfig(cfg, clock),
+                    .{
+                        .initial_capacity = cfg.initial_capacity,
+                        .max_entries = cfg.max_entries,
+                        .idle_timeout_ns = cfg.idle_timeout_ns,
+                    },
+                    key_options.context,
+                    key_options.ownership,
                 ),
             };
         }
@@ -312,6 +378,42 @@ fn makeProductionGlobalLimiter() !GlobalLimiter {
     });
 }
 
+const TestKey = struct {
+    tenant: u32,
+    name: []const u8,
+};
+
+const TestKeyContext = struct {
+    seed: u64,
+
+    pub fn hash(self: TestKeyContext, key: TestKey) u64 {
+        var value = self.seed ^ key.tenant;
+        for (key.name) |byte| {
+            value = (value ^ std.ascii.toLower(byte)) *% 0x100000001b3;
+        }
+        return value;
+    }
+
+    pub fn eql(_: TestKeyContext, a: TestKey, b: TestKey) bool {
+        return a.tenant == b.tenant and
+            std.ascii.eqlIgnoreCase(a.name, b.name);
+    }
+};
+
+fn cloneTestKey(
+    allocator: std.mem.Allocator,
+    key: TestKey,
+) std.mem.Allocator.Error!TestKey {
+    return .{
+        .tenant = key.tenant,
+        .name = try allocator.dupe(u8, key.name),
+    };
+}
+
+fn deinitTestKey(allocator: std.mem.Allocator, key: TestKey) void {
+    allocator.free(key.name);
+}
+
 test "production constructors remain valid after return by value" {
     var rate_limiter = try makeProductionRateLimiter();
     defer rate_limiter.deinit();
@@ -319,6 +421,73 @@ test "production constructors remain valid after return by value" {
 
     try std.testing.expect((try rate_limiter.allow("u")).isAllowed());
     try std.testing.expect(global_limiter.allow().isAllowed());
+}
+
+test "RateLimiterWithContext supports borrowed keys and custom equality" {
+    var mc = ManualClock{};
+    const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
+    var limiter = try CustomLimiter.initWithClockAndKeyOptions(
+        .{
+            .allocator = std.testing.allocator,
+            .limit = .perSecond(1),
+        },
+        mc.clock(),
+        .{
+            .context = .{ .seed = 42 },
+            .ownership = .borrowed,
+        },
+    );
+    defer limiter.deinit();
+
+    try std.testing.expect((try limiter.allow(.{
+        .tenant = 7,
+        .name = "Alice",
+    })).isAllowed());
+    try std.testing.expect(!(try limiter.allow(.{
+        .tenant = 7,
+        .name = "alice",
+    })).isAllowed());
+
+    limiter.remove(.{ .tenant = 7, .name = "ALICE" });
+    try std.testing.expectEqual(@as(usize, 0), limiter.keyCount());
+}
+
+test "RateLimiterWithContext can own deeply copied keys" {
+    var mc = ManualClock{};
+    const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
+    var limiter = try CustomLimiter.initWithClockAndKeyOptions(
+        .{
+            .allocator = std.testing.allocator,
+            .limit = .perSecond(1),
+        },
+        mc.clock(),
+        .{
+            .context = .{ .seed = 42 },
+            .ownership = .{ .owned = .{
+                .clone = cloneTestKey,
+                .deinit = deinitTestKey,
+            } },
+        },
+    );
+    defer limiter.deinit();
+
+    var original: ?[]u8 = try std.testing.allocator.dupe(u8, "Alice");
+    defer if (original) |name| std.testing.allocator.free(name);
+
+    try std.testing.expect((try limiter.allow(.{
+        .tenant = 7,
+        .name = original.?,
+    })).isAllowed());
+    std.testing.allocator.free(original.?);
+    original = null;
+
+    try std.testing.expect(!(try limiter.allow(.{
+        .tenant = 7,
+        .name = "alice",
+    })).isAllowed());
+
+    limiter.remove(.{ .tenant = 7, .name = "ALICE" });
+    try std.testing.expectEqual(@as(usize, 0), limiter.keyCount());
 }
 
 test "RateLimiter: allow — fresh key passes" {

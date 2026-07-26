@@ -23,6 +23,50 @@ pub const StorageOptions = struct {
     idle_timeout_ns: ?i64 = null,
 };
 
+pub fn KeyOwnership(comptime K: type) type {
+    return union(enum) {
+        /// The map copies the key value, but referenced memory remains owned
+        /// by the caller and must stay alive and hash-equivalent while stored.
+        borrowed,
+        /// The limiter owns a cloned key and destroys it when the entry leaves.
+        owned: struct {
+            clone: *const fn (std.mem.Allocator, K) std.mem.Allocator.Error!K,
+            deinit: *const fn (std.mem.Allocator, K) void,
+        },
+
+        const Self = @This();
+
+        /// Own string keys by duplicating and freeing their bytes.
+        pub fn copiedString() Self {
+            if (K != []const u8) {
+                @compileError("copiedString is only available for []const u8 keys");
+            }
+            return .{ .owned = .{
+                .clone = struct {
+                    fn clone(allocator: std.mem.Allocator, key: K) !K {
+                        return allocator.dupe(u8, key);
+                    }
+                }.clone,
+                .deinit = struct {
+                    fn deinit(allocator: std.mem.Allocator, key: K) void {
+                        allocator.free(key);
+                    }
+                }.deinit,
+            } };
+        }
+    };
+}
+
+pub fn DefaultContext(comptime K: type) type {
+    if (K == []const u8) return std.hash_map.StringContext;
+    return std.hash_map.AutoContext(K);
+}
+
+fn defaultOwnership(comptime K: type) KeyOwnership(K) {
+    if (K == []const u8) return .copiedString();
+    return .borrowed;
+}
+
 // ── Pure GCRA engine ──────────────────────────────────────────────────────────
 
 /// Run one GCRA check. Pure function — no allocations, no side effects.
@@ -160,24 +204,29 @@ fn deriveParameters(limit: Limit, burst: u32) ZimitError!Parameters {
 
 /// A rate limiter that tracks an arbitrary number of keys (IPs, user IDs, etc.).
 ///
-/// Keys are `K`. The limiter owns no memory beyond the HashMap itself —
-/// keys are hashed but not copied (unless K is []const u8, in which case
-/// the Limiter copies them to its own allocator).
+/// The default context copies string bytes and uses `AutoContext` with borrowed
+/// storage for other key types. `LimiterWithContext` accepts explicit hashing
+/// and ownership behavior.
 ///
 /// ### Thread Safety
 /// This type is **not** thread-safe. If you need to use the same `Limiter`
 /// instance across multiple threads, you must wrap it in a `std.Io.Mutex`.
 pub fn Limiter(comptime K: type) type {
+    return LimiterWithContext(K, DefaultContext(K));
+}
+
+pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
     return struct {
         const Self = @This();
         const State = struct {
             tat: i64,
             last_seen_ns: i64,
         };
-        const Store = std.HashMap(K, State, HashContext(K), 80);
+        const Store = std.HashMap(K, State, Context, 80);
 
         allocator: std.mem.Allocator,
         store: Store,
+        key_ownership: KeyOwnership(K),
         engine: Engine,
         max_entries: ?usize,
         idle_timeout_ns: ?i64,
@@ -208,11 +257,30 @@ pub fn Limiter(comptime K: type) type {
             config: Config,
             storage: StorageOptions,
         ) ZimitError!Self {
+            if (Context != DefaultContext(K)) {
+                @compileError("custom contexts must use initWithKeyOptions");
+            }
+            return initWithKeyOptions(
+                allocator,
+                config,
+                storage,
+                .{},
+                defaultOwnership(K),
+            );
+        }
+
+        pub fn initWithKeyOptions(
+            allocator: std.mem.Allocator,
+            config: Config,
+            storage: StorageOptions,
+            context: Context,
+            key_ownership: KeyOwnership(K),
+        ) ZimitError!Self {
             if (storage.idle_timeout_ns) |timeout| {
                 if (timeout <= 0) return error.InvalidIdleTimeout;
             }
             const engine = try Engine.init(config);
-            var store = Store.init(allocator);
+            var store = Store.initContext(allocator, context);
             errdefer store.deinit();
 
             const initial_capacity = if (storage.max_entries) |maximum|
@@ -224,6 +292,7 @@ pub fn Limiter(comptime K: type) type {
             return .{
                 .allocator = allocator,
                 .store = store,
+                .key_ownership = key_ownership,
                 .engine = engine,
                 .max_entries = storage.max_entries,
                 .idle_timeout_ns = storage.idle_timeout_ns,
@@ -231,14 +300,11 @@ pub fn Limiter(comptime K: type) type {
             };
         }
 
-        /// Releases all memory owned by the limiter.
-        /// If K is a string type, also frees all copied keys.
+        /// Releases the store and all keys owned by the limiter.
         pub fn deinit(self: *Self) void {
-            if (K == []const u8) {
-                var it = self.store.iterator();
-                while (it.next()) |entry| {
-                    self.allocator.free(entry.key_ptr.*);
-                }
+            var iterator = self.store.iterator();
+            while (iterator.next()) |entry| {
+                self.deinitKey(entry.key_ptr.*);
             }
             self.store.deinit();
         }
@@ -282,12 +348,9 @@ pub fn Limiter(comptime K: type) type {
             if (decision == .allowed) {
                 try self.maintainForNewKey(now);
 
-                const owned_key: K = if (K == []const u8)
-                    try self.allocator.dupe(u8, key)
-                else
-                    key;
+                const owned_key = try self.cloneKey(key);
 
-                errdefer if (K == []const u8) self.allocator.free(owned_key);
+                errdefer self.deinitKey(owned_key);
 
                 try self.store.put(owned_key, .{
                     .tat = decision.allowed.new_tat,
@@ -306,15 +369,10 @@ pub fn Limiter(comptime K: type) type {
             return self.engine.validateBatch(n);
         }
 
-        /// Remove a key from the store.
-        /// If K is a string type, also frees the copied key memory.
+        /// Remove a key and destroy it when using owned storage.
         pub fn remove(self: *Self, key: K) void {
-            if (K == []const u8) {
-                if (self.store.fetchRemove(key)) |kv| {
-                    self.allocator.free(kv.key);
-                }
-            } else {
-                _ = self.store.remove(key);
+            if (self.store.fetchRemove(key)) |entry| {
+                self.deinitKey(entry.key);
             }
         }
 
@@ -354,7 +412,7 @@ pub fn Limiter(comptime K: type) type {
 
                 const owned_key = entry.key_ptr.*;
                 self.store.removeByPtr(entry.key_ptr);
-                if (K == []const u8) self.allocator.free(owned_key);
+                self.deinitKey(owned_key);
                 removed += 1;
             }
 
@@ -369,13 +427,21 @@ pub fn Limiter(comptime K: type) type {
             const candidate = @max(state.tat, idle_expiration);
             self.next_prune_ns = @min(self.next_prune_ns, candidate);
         }
-    };
-}
 
-/// HashMap context — handles both `[]const u8` and integer key types.
-fn HashContext(comptime K: type) type {
-    if (K == []const u8) return std.hash_map.StringContext;
-    return std.hash_map.AutoContext(K);
+        fn cloneKey(self: *Self, key: K) std.mem.Allocator.Error!K {
+            return switch (self.key_ownership) {
+                .borrowed => key,
+                .owned => |owned| owned.clone(self.allocator, key),
+            };
+        }
+
+        fn deinitKey(self: *Self, key: K) void {
+            switch (self.key_ownership) {
+                .borrowed => {},
+                .owned => |owned| owned.deinit(self.allocator, key),
+            }
+        }
+    };
 }
 
 // ── AtomicLimiter ─────────────────────────────────────────────────────────────
