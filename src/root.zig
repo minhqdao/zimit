@@ -85,6 +85,28 @@ pub const GlobalLimiterConfig = struct {
     clock: Clock,
 };
 
+fn engineConfig(config: anytype) gcra.Config {
+    return .{
+        .limit = config.limit,
+        .burst = config.burst,
+        .clock = config.clock,
+    };
+}
+
+fn waitForN(
+    io: std.Io,
+    n: u32,
+    context: anytype,
+    comptime allowNFn: anytype,
+) !void {
+    while (true) {
+        switch (try allowNFn(context, n)) {
+            .allowed => return,
+            .denied => |denied| try io.sleep(denied.retry_after, .awake),
+        }
+    }
+}
+
 // ── GlobalLimiter ─────────────────────────────────────────────────────────────
 
 /// A lock-free single-key rate limiter with a token-bucket-flavored API.
@@ -102,7 +124,7 @@ pub const GlobalLimiter = struct {
 
     /// Initialise a global limiter.
     pub fn init(cfg: GlobalLimiterConfig) ZimitError!GlobalLimiter {
-        return .{ .inner = try gcra.AtomicLimiter.init(cfg.limit, cfg.burst, cfg.clock) };
+        return .{ .inner = try gcra.AtomicLimiter.initWithConfig(engineConfig(cfg)) };
     }
 
     /// Convenience for `allowN(1)`.
@@ -117,15 +139,18 @@ pub const GlobalLimiter = struct {
     }
 
     /// Block the calling thread until allowed.
-    /// Same design seam as `RateLimiter.wait` — replace with fiber suspension
-    /// once Zig 0.16.0 async lands.
     pub fn wait(self: *GlobalLimiter, io: std.Io) !void {
-        while (true) {
-            switch (self.allow()) {
-                .allowed => return,
-                .denied => |d| try io.sleep(d.retry_after, .awake),
-            }
-        }
+        return self.waitN(io, 1);
+    }
+
+    /// Block until an atomic batch of `n` requests is allowed.
+    pub fn waitN(self: *GlobalLimiter, io: std.Io, n: u32) !void {
+        try self.inner.validateBatch(n);
+        return waitForN(io, n, self, attemptN);
+    }
+
+    fn attemptN(self: *GlobalLimiter, n: u32) ZimitError!Decision {
+        return self.allowN(n);
     }
 
     /// Resets the limiter to its initial state.
@@ -151,17 +176,19 @@ pub fn RateLimiter(comptime K: type) type {
     return struct {
         const Self = @This();
         const Inner = gcra.Limiter(K);
+        const WaitContext = struct {
+            limiter: *Self,
+            key: K,
+        };
 
         inner: Inner,
 
         /// Create a new limiter from a `RateLimiterConfig`.
         pub fn init(cfg: RateLimiterConfig) ZimitError!Self {
             return .{
-                .inner = try Inner.initWithStorage(
+                .inner = try Inner.initWithConfigAndStorage(
                     cfg.allocator,
-                    cfg.limit,
-                    cfg.burst,
-                    cfg.clock,
+                    engineConfig(cfg),
                     .{
                         .initial_capacity = cfg.initial_capacity,
                         .max_entries = cfg.max_entries,
@@ -199,13 +226,20 @@ pub fn RateLimiter(comptime K: type) type {
         /// This is the simple synchronous wait. For async contexts, use
         /// `allow` and handle the retry duration yourself.
         pub fn wait(self: *Self, io: std.Io, key: K) !void {
-            while (true) {
-                const decision = try self.allow(key);
-                switch (decision) {
-                    .allowed => return,
-                    .denied => |d| try io.sleep(d.retry_after, .awake),
-                }
-            }
+            return self.waitN(io, key, 1);
+        }
+
+        /// Block until an atomic batch of `n` requests is allowed for `key`.
+        pub fn waitN(self: *Self, io: std.Io, key: K, n: u32) !void {
+            try self.inner.validateBatch(n);
+            return waitForN(io, n, WaitContext{
+                .limiter = self,
+                .key = key,
+            }, attemptN);
+        }
+
+        fn attemptN(context: WaitContext, n: u32) ZimitError!Decision {
+            return context.limiter.allowN(context.key, n);
         }
 
         /// Remove a key from the store — useful when a session ends and you
@@ -814,6 +848,36 @@ test "RateLimiter: wait blocks and succeeds" {
     try std.testing.expect(end - start >= 50);
 }
 
+test "RateLimiter: waitN blocks until the full batch is allowed" {
+    var sys = SystemClock.init(std.testing.io);
+    var lim = try RateLimiter(u32).init(.{
+        .allocator = std.testing.allocator,
+        .limit = .perSecond(10),
+        .burst = 1,
+        .clock = sys.clock(),
+    });
+    defer lim.deinit();
+
+    try std.testing.expect((try lim.allowN(42, 2)).isAllowed());
+
+    const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try lim.waitN(std.testing.io, 42, 2);
+    const end = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+
+    try std.testing.expect(end - start >= 100);
+}
+
+test "RateLimiter: waitN rejects an impossible batch" {
+    var mc = ManualClock{};
+    var lim = try makeLimiter(.perSecond(10), 0, &mc);
+    defer lim.deinit();
+
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.waitN(std.testing.io, "u", 2),
+    );
+}
+
 test "RateLimiter: stress — 10k unique keys" {
     var mc = ManualClock{};
     var lim = try RateLimiter(u32).init(.{
@@ -1033,6 +1097,36 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     const end = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
 
     try std.testing.expect(end - start >= 50); // allow some slack
+}
+
+test "GlobalLimiter: waitN blocks until the full batch is allowed" {
+    var sys = SystemClock.init(std.testing.io);
+    var lim = try GlobalLimiter.init(.{
+        .limit = .perSecond(10),
+        .burst = 1,
+        .clock = sys.clock(),
+    });
+
+    try std.testing.expect(lim.allowN(2).isAllowed());
+
+    const start = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+    try lim.waitN(std.testing.io, 2);
+    const end = std.Io.Clock.awake.now(std.testing.io).toMilliseconds();
+
+    try std.testing.expect(end - start >= 100);
+}
+
+test "GlobalLimiter: waitN rejects an impossible batch" {
+    var mc = ManualClock{};
+    var lim = try GlobalLimiter.init(.{
+        .limit = .perSecond(10),
+        .clock = mc.clock(),
+    });
+
+    try std.testing.expectError(
+        error.BatchTooLarge,
+        lim.waitN(std.testing.io, 2),
+    );
 }
 
 test "GlobalLimiter: allowN batch" {

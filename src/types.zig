@@ -174,6 +174,8 @@ pub const ZimitError = error{
     CapacityExceeded,
     /// The configured idle timeout is not positive.
     InvalidIdleTimeout,
+    /// A batch exceeds configured capacity or the representable time range.
+    BatchTooLarge,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
