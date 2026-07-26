@@ -1480,7 +1480,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
         .allowed = std.atomic.Value(usize).init(0),
     };
 
-    const start_ns = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
 
     var threads: [num_threads]std.Thread = undefined;
     for (&threads) |*t| {
@@ -1488,7 +1488,7 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
     }
     for (&threads) |*t| t.join();
 
-    const elapsed_ns = std.Io.Timestamp.now(std.testing.io, .real).toNanoseconds() - start_ns;
+    const elapsed_ns = std.Io.Clock.awake.now(std.testing.io).toNanoseconds() - start_ns;
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
 
     const total_allowed = ctx.allowed.load(.monotonic);

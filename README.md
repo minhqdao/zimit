@@ -11,7 +11,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
   - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; larger batches are denied.
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
 - **Clocks:**
-  - `SystemClock` → Production (requires `std.process.Init.io`)
+  - `SystemClock` → Production monotonic clock (requires `std.process.Init.io`; uses Zig's `.awake` clock, matching limiter waits)
   - `ManualClock` → Deterministic tests
 
 ## Usage
