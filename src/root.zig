@@ -99,7 +99,8 @@ pub const Outcome = union(enum) {
 
         /// Convenience: retry delay in whole milliseconds (rounded up).
         pub fn retryAfterMsCeil(self: @This()) i64 {
-            return @divTrunc(self.retry_after_ns + 999_999, 1_000_000);
+            const milliseconds = @divFloor(self.retry_after_ns, 1_000_000);
+            return milliseconds + @intFromBool(@mod(self.retry_after_ns, 1_000_000) != 0);
         }
     },
 
@@ -978,6 +979,28 @@ test "Outcome: retryAfterMsCeil just over boundary" {
         .denied => |d| try std.testing.expectEqual(@as(i64, 6), d.retryAfterMsCeil()),
         .allowed => return error.TestUnexpectedResult,
     }
+}
+
+test "Outcome: retryAfterMsCeil handles maximum retry without overflow" {
+    const outcome = Outcome{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+    const expected = @divFloor(std.math.maxInt(i64), 1_000_000) + 1;
+    switch (outcome) {
+        .denied => |d| try std.testing.expectEqual(expected, d.retryAfterMsCeil()),
+        .allowed => return error.TestUnexpectedResult,
+    }
+}
+
+test "GlobalLimiter: init rejects unrepresentable burst duration" {
+    var mc = ManualClock{};
+    try std.testing.expectError(
+        error.TimeOverflow,
+        GlobalLimiter.init(.{
+            .rate = 1,
+            .per = .hour,
+            .burst = std.math.maxInt(u32),
+            .clock = mc.clock(),
+        }),
+    );
 }
 
 test "Outcome: isAllowed matches tagged union" {
