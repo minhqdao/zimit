@@ -29,7 +29,7 @@ pub const StorageOptions = struct {
 ///   burst_offset_ns  How far into the past the TAT may lag (Limit.burstOffset()).
 ///
 /// Returns a `Decision`. On `.allowed`, persist `decision.new_tat` back to
-/// your store. On `.denied`, wait `decision.retry_after_ns` before retrying.
+/// your store. On `.denied`, wait `decision.retry_after` before retrying.
 pub fn check(
     tat: i64,
     now_ns: i64,
@@ -65,11 +65,15 @@ fn checkN(
 
     if (allow_at <= now_ns) {
         if (new_tat > std.math.maxInt(i64) or new_tat < std.math.minInt(i64)) {
-            return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+            return .{ .denied = .{
+                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
+            } };
         }
         return .{ .allowed = .{ .new_tat = @intCast(new_tat) } };
     } else {
-        return .{ .denied = .{ .retry_after_ns = saturatingI64(allow_at - @as(i128, now_ns)) } };
+        return .{ .denied = .{ .retry_after = .fromNanoseconds(
+            saturatingI64(allow_at - @as(i128, now_ns)),
+        ) } };
     }
 }
 
@@ -204,7 +208,9 @@ pub fn Limiter(comptime K: type) type {
             }
 
             if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
-                return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+                return .{ .denied = .{
+                    .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
+                } };
             }
 
             const now = self.clock.now();
@@ -385,7 +391,9 @@ pub const AtomicLimiter = struct {
         }
 
         if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
-            return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
+            return .{ .denied = .{
+                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
+            } };
         }
 
         const now = self.clock.now();
@@ -463,13 +471,13 @@ test "check: request exactly at next slot boundary is allowed" {
     try std.testing.expect(second.isAllowed());
 }
 
-test "check: retry_after_ns is accurate" {
+test "check: retry duration is accurate" {
     const interval: i64 = 10_000_000; // 10ms
     const now: i64 = 1_000_000_000;
     const first = check(0, now, interval, 0);
     const second = check(first.allowed.new_tat, now, interval, 0);
     // Should need to wait ~10ms
-    try std.testing.expectEqual(interval, second.denied.retry_after_ns);
+    try std.testing.expectEqual(interval, second.denied.retry_after.toNanoseconds());
 }
 
 test "check: burst=5 allows 6 requests at t=0" {
@@ -629,7 +637,7 @@ test "check: unrepresentable new TAT fails closed" {
     try std.testing.expect(!d.isAllowed());
     try std.testing.expectEqual(
         @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after_ns,
+        d.denied.retry_after.toNanoseconds(),
     );
 }
 
@@ -652,7 +660,7 @@ test "check: retry duration saturates instead of overflowing" {
     try std.testing.expect(!d.isAllowed());
     try std.testing.expectEqual(
         @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after_ns,
+        d.denied.retry_after.toNanoseconds(),
     );
 }
 
@@ -695,7 +703,7 @@ test "check: denied retry_after is exact gap" {
     // retry_after should be (tat + interval - burstOffset - interval) - now = tat - now
     // tat = now + interval = 1_100_000_000, later = 1_030_000_000
     // retry = 1_100_000_000 - 1_030_000_000 = 70_000_000
-    try std.testing.expectEqual(@as(i64, 70_000_000), d2.denied.retry_after_ns);
+    try std.testing.expectEqual(@as(i64, 70_000_000), d2.denied.retry_after.toNanoseconds());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1024,7 +1032,7 @@ test "Limiter: checkKeyN denial does not change state" {
     try std.testing.expect((try lim.checkKeyN("u", 5)).isAllowed());
 }
 
-test "Limiter: retry_after_ns can be zero at boundary" {
+test "Limiter: retry duration can be zero at boundary" {
     var mc = types.ManualClock{};
     mc.set(0);
 
@@ -1404,7 +1412,7 @@ test "AtomicLimiter: reset clears state" {
     try std.testing.expect(lim.allow().isAllowed());
 }
 
-test "AtomicLimiter: retry_after_ns is positive on denial" {
+test "AtomicLimiter: retry duration is positive on denial" {
     var mc = types.ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perSecond(1), 0, mc.clock());
@@ -1412,7 +1420,7 @@ test "AtomicLimiter: retry_after_ns is positive on denial" {
     _ = lim.allow();
     const d = lim.allow();
     switch (d) {
-        .denied => |denied| try std.testing.expect(denied.retry_after_ns > 0),
+        .denied => |denied| try std.testing.expect(denied.retry_after.toNanoseconds() > 0),
         .allowed => return error.TestUnexpectedResult,
     }
 }
@@ -1487,7 +1495,7 @@ test "AtomicLimiter: allowN overflow guard returns maxInt retry_after" {
     switch (d) {
         .denied => |denied| try std.testing.expectEqual(
             @as(i64, std.math.maxInt(i64)),
-            denied.retry_after_ns,
+            denied.retry_after.toNanoseconds(),
         ),
         .allowed => return error.TestUnexpectedResult,
     }
@@ -1510,7 +1518,7 @@ test "AtomicLimiter: allowN large but valid n still works" {
 
     try std.testing.expect(!d.isAllowed());
     // Finite wait — proves it was GCRA, not the overflow guard
-    try std.testing.expect(d.denied.retry_after_ns < std.math.maxInt(i64));
+    try std.testing.expect(d.denied.retry_after.toNanoseconds() < std.math.maxInt(i64));
 }
 
 test "AtomicLimiter: allowN boundary exactly at max_batch does not overflow" {
@@ -1531,7 +1539,7 @@ test "AtomicLimiter: allowN boundary exactly at max_batch does not overflow" {
     switch (d) {
         .allowed => {},
         .denied => |denied| try std.testing.expect(
-            denied.retry_after_ns < std.math.maxInt(i64),
+            denied.retry_after.toNanoseconds() < std.math.maxInt(i64),
         ),
     }
 }
@@ -1570,7 +1578,7 @@ test "AtomicLimiter: unrepresentable future TAT fails closed" {
     try std.testing.expect(!d.isAllowed());
     try std.testing.expectEqual(
         @as(i64, std.math.maxInt(i64)),
-        d.denied.retry_after_ns,
+        d.denied.retry_after.toNanoseconds(),
     );
     try std.testing.expectEqual(@as(i64, 0), lim.tat.load(.monotonic));
 }
@@ -1584,10 +1592,10 @@ test "AtomicLimiter: denial has finite retry_after (not overflow guard)" {
     const d = lim.allow();
     switch (d) {
         .denied => |denied| {
-            try std.testing.expect(denied.retry_after_ns > 0);
-            try std.testing.expect(denied.retry_after_ns < std.math.maxInt(i64));
+            try std.testing.expect(denied.retry_after.toNanoseconds() > 0);
+            try std.testing.expect(denied.retry_after.toNanoseconds() < std.math.maxInt(i64));
             // Should be approximately 1 second
-            try std.testing.expect(denied.retry_after_ns <= std.time.ns_per_s);
+            try std.testing.expect(denied.retry_after.toNanoseconds() <= std.time.ns_per_s);
         },
         .allowed => return error.TestUnexpectedResult,
     }

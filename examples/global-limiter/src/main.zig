@@ -14,10 +14,13 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        switch (limiter.allow()) {
+        const decision = limiter.allow();
+        switch (decision) {
             .allowed => std.debug.print("allowed\n", .{}),
-            .denied => |d| {
-                std.debug.print("denied, time until allowed: {d} ms\n", .{d.retryAfterMsCeil()});
+            .denied => {
+                std.debug.print("retry in {d} ms\n", .{
+                    decision.retryAfterMillisecondsCeil().?,
+                });
             },
         }
     }

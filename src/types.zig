@@ -60,22 +60,30 @@ pub const Decision = union(enum) {
     /// the caller must persist back to the store.
     allowed: struct { new_tat: i64 },
 
-    /// Request is denied. `retry_after_ns` is how many nanoseconds the caller
-    /// should wait before retrying. The caller decides whether to sleep,
-    /// suspend a fiber, return a 429, or do something else entirely.
-    denied: struct { retry_after_ns: i64 },
+    /// Request is denied. The caller decides whether to sleep, suspend a fiber,
+    /// return a 429, or do something else with `retry_after`.
+    denied: struct { retry_after: std.Io.Duration },
 
     /// Returns true if the request was allowed.
     pub fn isAllowed(self: Decision) bool {
         return self == .allowed;
     }
 
-    /// Returns the retry delay in nanoseconds if denied, else null.
-    pub fn retryAfterNs(self: Decision) ?i64 {
+    /// Returns the retry delay if denied, otherwise `null`.
+    pub fn retryAfter(self: Decision) ?std.Io.Duration {
         return switch (self) {
-            .denied => |d| d.retry_after_ns,
+            .denied => |d| d.retry_after,
             .allowed => null,
         };
+    }
+
+    /// Returns the retry delay in whole milliseconds, rounded up, if denied.
+    pub fn retryAfterMillisecondsCeil(self: Decision) ?i64 {
+        const duration = self.retryAfter() orelse return null;
+        const nanoseconds = duration.toNanoseconds();
+        const milliseconds = @divFloor(nanoseconds, std.time.ns_per_ms);
+        return @intCast(milliseconds +
+            @intFromBool(@mod(nanoseconds, std.time.ns_per_ms) != 0));
     }
 };
 
@@ -239,16 +247,58 @@ test "Limit.burstOffset: burst=maxInt(u32) with large interval does not panic" {
 
 test "Decision.isAllowed" {
     const allowed = Decision{ .allowed = .{ .new_tat = 42 } };
-    const denied = Decision{ .denied = .{ .retry_after_ns = 1000 } };
+    const denied = Decision{ .denied = .{
+        .retry_after = .fromNanoseconds(1000),
+    } };
     try std.testing.expect(allowed.isAllowed());
     try std.testing.expect(!denied.isAllowed());
 }
 
-test "Decision.retry_after_ns" {
+test "Decision.retryAfter returns an Io Duration" {
     const allowed = Decision{ .allowed = .{ .new_tat = 0 } };
-    const denied = Decision{ .denied = .{ .retry_after_ns = 5_000_000 } };
-    try std.testing.expectEqual(@as(?i64, null), allowed.retryAfterNs());
-    try std.testing.expectEqual(@as(?i64, 5_000_000), denied.retryAfterNs());
+    const denied = Decision{ .denied = .{
+        .retry_after = .fromNanoseconds(5_000_000),
+    } };
+
+    try std.testing.expectEqual(@as(?std.Io.Duration, null), allowed.retryAfter());
+    try std.testing.expectEqual(
+        @as(i96, 5_000_000),
+        denied.retryAfter().?.toNanoseconds(),
+    );
+}
+
+test "Decision.retryAfterMillisecondsCeil rounds up safely" {
+    const cases = [_]struct {
+        nanoseconds: i64,
+        expected_milliseconds: i64,
+    }{
+        .{ .nanoseconds = 1, .expected_milliseconds = 1 },
+        .{ .nanoseconds = 5_000_000, .expected_milliseconds = 5 },
+        .{ .nanoseconds = 5_000_001, .expected_milliseconds = 6 },
+        .{
+            .nanoseconds = std.math.maxInt(i64),
+            .expected_milliseconds = @divFloor(
+                std.math.maxInt(i64),
+                std.time.ns_per_ms,
+            ) + 1,
+        },
+    };
+
+    for (cases) |case| {
+        const decision = Decision{ .denied = .{
+            .retry_after = .fromNanoseconds(case.nanoseconds),
+        } };
+        try std.testing.expectEqual(
+            @as(?i64, case.expected_milliseconds),
+            decision.retryAfterMillisecondsCeil(),
+        );
+    }
+
+    const allowed = Decision{ .allowed = .{ .new_tat = 0 } };
+    try std.testing.expectEqual(
+        @as(?i64, null),
+        allowed.retryAfterMillisecondsCeil(),
+    );
 }
 
 test "SystemClock: monotonic non-decreasing without sleep" {
@@ -351,14 +401,4 @@ test "ManualClock: negative tick saturates at minimum" {
     var c = ManualClock{ .time_ns = std.math.minInt(i64) + 1 };
     c.tick(-2);
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), c.clock().now());
-}
-
-test "Decision: allowed isAllowed returns true" {
-    const d = Decision{ .allowed = .{ .new_tat = 0 } };
-    try std.testing.expect(d.isAllowed());
-}
-
-test "Decision: denied isAllowed returns false" {
-    const d = Decision{ .denied = .{ .retry_after_ns = 100 } };
-    try std.testing.expect(!d.isAllowed());
 }
