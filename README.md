@@ -8,7 +8,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 - **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
 - **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with `idle_timeout_ns` to bound memory and reclaim inactive, fully-drained keys.
 - **Blocking vs non-blocking:**
-  - `allow()` → Immediate decision
+  - `allow()` → Immediate `Decision`; denied results carry a `std.Io.Duration`
   - `allowN(n)` → Atomically consumes `n` requests. The maximum batch size is `1 + burst`; larger batches are denied.
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
 - **Clocks:**
@@ -39,10 +39,13 @@ pub fn main(init: std.process.Init) !void {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        switch (try limiter.allow(key)) {
+        const decision = try limiter.allow(key);
+        switch (decision) {
             .allowed => std.debug.print("allowed\n", .{}),
-            .denied => |d| {
-                std.debug.print("denied, time until allowed: {d}ms\n", .{d.retryAfterMsCeil()});
+            .denied => {
+                std.debug.print("retry in {d}ms\n", .{
+                    decision.retryAfterMillisecondsCeil().?,
+                });
             },
         }
     }

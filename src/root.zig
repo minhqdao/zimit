@@ -23,10 +23,13 @@
 //!
 //!     var i: usize = 0;
 //!     while (i < 5) : (i += 1) {
-//!         switch (try limiter.allow(key)) {
+//!         const decision = try limiter.allow(key);
+//!         switch (decision) {
 //!             .allowed => std.debug.print("allowed\n", .{}),
-//!             .denied => |d| {
-//!                 std.debug.print("denied, time until allowed: {d}ms\n", .{d.retryAfterMsCeil()});
+//!             .denied => {
+//!                 std.debug.print("retry in {d}ms\n", .{
+//!                     decision.retryAfterMillisecondsCeil().?,
+//!                 });
 //!             },
 //!         }
 //!     }
@@ -82,30 +85,6 @@ pub const GlobalLimiterConfig = struct {
     clock: Clock,
 };
 
-// ── Outcome ───────────────────────────────────────────────────────────────────
-
-/// What the caller receives from `allow` / `allowN`.
-/// Richer than a plain bool — carries the wait time so callers
-/// can implement backoff, 429 headers, or fiber suspension.
-pub const Outcome = union(enum) {
-    allowed,
-    denied: struct {
-        /// How long to wait before retrying, in nanoseconds.
-        retry_after_ns: i64,
-
-        /// Convenience: retry delay in whole milliseconds (rounded up).
-        pub fn retryAfterMsCeil(self: @This()) i64 {
-            const milliseconds = @divFloor(self.retry_after_ns, 1_000_000);
-            return milliseconds + @intFromBool(@mod(self.retry_after_ns, 1_000_000) != 0);
-        }
-    },
-
-    /// Returns true if the outcome was allowed.
-    pub fn isAllowed(self: Outcome) bool {
-        return self == .allowed;
-    }
-};
-
 // ── GlobalLimiter ─────────────────────────────────────────────────────────────
 
 /// A lock-free single-key rate limiter with a token-bucket-flavored API.
@@ -127,17 +106,14 @@ pub const GlobalLimiter = struct {
     }
 
     /// Convenience for `allowN(1)`.
-    pub fn allow(self: *GlobalLimiter) Outcome {
+    pub fn allow(self: *GlobalLimiter) Decision {
         return self.allowN(1);
     }
 
     /// Atomically consume `n` slots.
     /// A batch can contain at most `1 + burst` requests.
-    pub fn allowN(self: *GlobalLimiter, n: u32) Outcome {
-        return switch (self.inner.allowN(n)) {
-            .allowed => .allowed,
-            .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
-        };
+    pub fn allowN(self: *GlobalLimiter, n: u32) Decision {
+        return self.inner.allowN(n);
     }
 
     /// Block the calling thread until allowed.
@@ -147,7 +123,7 @@ pub const GlobalLimiter = struct {
         while (true) {
             switch (self.allow()) {
                 .allowed => return,
-                .denied => |d| try io.sleep(.fromNanoseconds(d.retry_after_ns), .awake),
+                .denied => |d| try io.sleep(d.retry_after, .awake),
             }
         }
     }
@@ -205,7 +181,7 @@ pub fn RateLimiter(comptime K: type) type {
         /// On `.allowed` the internal state is updated immediately.
         /// On `.denied` the rate state is unchanged, but the key's last-seen
         /// time is refreshed when idle expiration is configured.
-        pub fn allow(self: *Self, key: K) ZimitError!Outcome {
+        pub fn allow(self: *Self, key: K) ZimitError!Decision {
             return self.allowN(key, 1);
         }
 
@@ -214,23 +190,20 @@ pub fn RateLimiter(comptime K: type) type {
         /// All `n` slots are consumed together or none are — there is no
         /// partial allowance. A batch can contain at most `1 + burst`
         /// requests. Useful for batch jobs or chunked uploads.
-        pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Outcome {
-            return switch (try self.inner.checkKeyN(key, n)) {
-                .allowed => .allowed,
-                .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
-            };
+        pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Decision {
+            return self.inner.checkKeyN(key, n);
         }
 
         /// Block the calling thread until `key` is allowed.
         ///
         /// This is the simple synchronous wait. For async contexts, use
-        /// `allow` and handle the `retry_after_ns` yourself.
+        /// `allow` and handle the retry duration yourself.
         pub fn wait(self: *Self, io: std.Io, key: K) !void {
             while (true) {
-                const outcome = try self.allow(key);
-                switch (outcome) {
+                const decision = try self.allow(key);
+                switch (decision) {
                     .allowed => return,
-                    .denied => |d| try io.sleep(.fromNanoseconds(d.retry_after_ns), .awake),
+                    .denied => |d| try io.sleep(d.retry_after, .awake),
                 }
             }
         }
@@ -307,7 +280,7 @@ test "RateLimiter: allow — exhausted key is denied" {
     try std.testing.expect(!out.isAllowed());
 }
 
-test "RateLimiter: allow — retryAfterMsCeil rounds up" {
+test "RateLimiter: retryAfterMillisecondsCeil rounds up" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // 1 req/s → emission interval = 1 000 000 000 ns = 1000 ms
@@ -318,9 +291,9 @@ test "RateLimiter: allow — retryAfterMsCeil rounds up" {
     const out = try lim.allow("u");
     switch (out) {
         .denied => |d| {
-            // retry_after_ns should be ~1s; ms should round up to 1000
-            try std.testing.expect(d.retry_after_ns > 0);
-            try std.testing.expectEqual(@as(i64, 1000), d.retryAfterMsCeil());
+            // The retry duration should be ~1s and round up to 1000ms.
+            try std.testing.expect(d.retry_after.toNanoseconds() > 0);
+            try std.testing.expectEqual(@as(i64, 1000), out.retryAfterMillisecondsCeil().?);
         },
         .allowed => return error.TestUnexpectedResult,
     }
@@ -542,7 +515,7 @@ test "RateLimiter: allowN overflow guard returns maxInt retry_after" {
     switch (out) {
         .denied => |d| try std.testing.expectEqual(
             @as(i64, std.math.maxInt(i64)),
-            d.retry_after_ns,
+            d.retry_after.toNanoseconds(),
         ),
         .allowed => return error.TestUnexpectedResult,
     }
@@ -570,7 +543,7 @@ test "RateLimiter: allowN large but valid n is evaluated normally" {
     const out = try lim.allowN("u", 5);
     switch (out) {
         .allowed => {},
-        .denied => |d| try std.testing.expect(d.retry_after_ns < std.math.maxInt(i64)),
+        .denied => |d| try std.testing.expect(d.retry_after.toNanoseconds() < std.math.maxInt(i64)),
     }
 }
 
@@ -780,7 +753,7 @@ test "RateLimiter: init rejects non-positive idle timeout" {
     );
 }
 
-test "RateLimiter: retry_after_ns is positive on denial" {
+test "RateLimiter: retry duration is positive on denial" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
@@ -789,12 +762,12 @@ test "RateLimiter: retry_after_ns is positive on denial" {
     _ = try lim.allow("u");
     const out = try lim.allow("u");
     switch (out) {
-        .denied => |d| try std.testing.expect(d.retry_after_ns > 0),
+        .denied => |d| try std.testing.expect(d.retry_after.toNanoseconds() > 0),
         .allowed => return error.TestUnexpectedResult,
     }
 }
 
-test "RateLimiter: retry_after_ns decreases as time advances" {
+test "RateLimiter: retry duration decreases as time advances" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(.perSecond(1), 0, &mc);
@@ -804,7 +777,7 @@ test "RateLimiter: retry_after_ns decreases as time advances" {
 
     const out1 = try lim.allow("u");
     const wait1 = switch (out1) {
-        .denied => |d| d.retry_after_ns,
+        .denied => |d| d.retry_after.toNanoseconds(),
         .allowed => return error.TestUnexpectedResult,
     };
 
@@ -812,7 +785,7 @@ test "RateLimiter: retry_after_ns decreases as time advances" {
 
     const out2 = try lim.allow("u");
     const wait2 = switch (out2) {
-        .denied => |d| d.retry_after_ns,
+        .denied => |d| d.retry_after.toNanoseconds(),
         .allowed => return error.TestUnexpectedResult,
     };
 
@@ -1088,7 +1061,7 @@ test "GlobalLimiter: allowN fresh limiter without burst denies batch" {
     try std.testing.expect(lim.allow().isAllowed());
 }
 
-test "GlobalLimiter: retryAfterMsCeil is non-zero on denial" {
+test "GlobalLimiter: retryAfterMillisecondsCeil is non-zero on denial" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.init(.{
@@ -1098,8 +1071,11 @@ test "GlobalLimiter: retryAfterMsCeil is non-zero on denial" {
     });
 
     _ = lim.allow();
-    switch (lim.allow()) {
-        .denied => |d| try std.testing.expect(d.retryAfterMsCeil() > 0),
+    const decision = lim.allow();
+    switch (decision) {
+        .denied => try std.testing.expect(
+            decision.retryAfterMillisecondsCeil().? > 0,
+        ),
         .allowed => return error.TestUnexpectedResult,
     }
 }
@@ -1118,7 +1094,7 @@ test "GlobalLimiter: allowN overflow guard" {
     switch (out) {
         .denied => |d| try std.testing.expectEqual(
             @as(i64, std.math.maxInt(i64)),
-            d.retry_after_ns,
+            d.retry_after.toNanoseconds(),
         ),
         .allowed => return error.TestUnexpectedResult,
     }
@@ -1138,42 +1114,6 @@ test "GlobalLimiter: allowN overflow guard does not mutate state" {
     try std.testing.expect(lim.allow().isAllowed());
 }
 
-test "Outcome: retryAfterMsCeil rounds up from 1ns" {
-    // 1 ns → ceil(1 / 1_000_000) = 1 ms
-    const outcome = Outcome{ .denied = .{ .retry_after_ns = 1 } };
-    switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 1), d.retryAfterMsCeil()),
-        .allowed => return error.TestUnexpectedResult,
-    }
-}
-
-test "Outcome: retryAfterMsCeil exact millisecond boundary" {
-    // Exactly 5ms = 5_000_000 ns → should be 5ms, not 6ms
-    const outcome = Outcome{ .denied = .{ .retry_after_ns = 5_000_000 } };
-    switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 5), d.retryAfterMsCeil()),
-        .allowed => return error.TestUnexpectedResult,
-    }
-}
-
-test "Outcome: retryAfterMsCeil just over boundary" {
-    // 5_000_001 ns → ceil = 6ms
-    const outcome = Outcome{ .denied = .{ .retry_after_ns = 5_000_001 } };
-    switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 6), d.retryAfterMsCeil()),
-        .allowed => return error.TestUnexpectedResult,
-    }
-}
-
-test "Outcome: retryAfterMsCeil handles maximum retry without overflow" {
-    const outcome = Outcome{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
-    const expected = @divFloor(std.math.maxInt(i64), 1_000_000) + 1;
-    switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(expected, d.retryAfterMsCeil()),
-        .allowed => return error.TestUnexpectedResult,
-    }
-}
-
 test "GlobalLimiter: init rejects unrepresentable burst duration" {
     var mc = ManualClock{};
     try std.testing.expectError(
@@ -1184,11 +1124,4 @@ test "GlobalLimiter: init rejects unrepresentable burst duration" {
             .clock = mc.clock(),
         }),
     );
-}
-
-test "Outcome: isAllowed matches tagged union" {
-    const allowed = Outcome{ .allowed = {} };
-    const denied = Outcome{ .denied = .{ .retry_after_ns = 42 } };
-    try std.testing.expect(allowed.isAllowed());
-    try std.testing.expect(!denied.isAllowed());
 }
