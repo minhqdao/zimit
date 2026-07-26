@@ -89,15 +89,33 @@ pub const Decision = union(enum) {
 
 // ── Clock ─────────────────────────────────────────────────────────────────────
 
-/// Anything that can tell us the current time in nanoseconds.
-/// Use `SystemClock` in production. Pass a `ManualClock` in tests.
-pub const Clock = struct {
-    ptr: *anyopaque,
-    now_fn: *const fn (ptr: *anyopaque) i64,
+/// A time source used by the limiter.
+///
+/// The system variant owns a copy of `std.Io`, so it remains valid when the
+/// limiter is moved. Custom clocks borrow their backing object.
+pub const Clock = union(enum) {
+    system: std.Io,
+    custom: struct {
+        ptr: *anyopaque,
+        now_fn: *const fn (ptr: *anyopaque) i64,
+    },
 
     /// Returns the current time in nanoseconds.
     pub fn now(self: Clock) i64 {
-        return self.now_fn(self.ptr);
+        return switch (self) {
+            .system => |io| systemNow(io),
+            .custom => |custom| custom.now_fn(custom.ptr),
+        };
+    }
+
+    fn systemNow(io: std.Io) i64 {
+        const ts = std.Io.Clock.awake.now(io);
+        const ns = ts.toNanoseconds();
+        return @intCast(std.math.clamp(
+            ns,
+            std.math.minInt(i64),
+            std.math.maxInt(i64),
+        ));
     }
 };
 
@@ -115,20 +133,9 @@ pub const SystemClock = struct {
         return .{ .io = io };
     }
 
-    /// Returns a generic `Clock` interface backed by this SystemClock.
-    pub fn clock(self: *SystemClock) Clock {
-        return .{ .ptr = self, .now_fn = nowImpl };
-    }
-
-    fn nowImpl(ptr: *anyopaque) i64 {
-        const self: *SystemClock = @ptrCast(@alignCast(ptr));
-        const ts = std.Io.Clock.awake.now(self.io);
-        const ns = ts.toNanoseconds();
-        return @intCast(std.math.clamp(
-            ns,
-            std.math.minInt(i64),
-            std.math.maxInt(i64),
-        ));
+    /// Returns a movable clock that owns a copy of the `std.Io` interface.
+    pub fn clock(self: SystemClock) Clock {
+        return .{ .system = self.io };
     }
 };
 
@@ -139,7 +146,7 @@ pub const ManualClock = struct {
 
     /// Returns a generic `Clock` interface backed by this ManualClock.
     pub fn clock(self: *ManualClock) Clock {
-        return .{ .ptr = self, .now_fn = nowImpl };
+        return .{ .custom = .{ .ptr = self, .now_fn = nowImpl } };
     }
 
     /// Sets the clock to an absolute time in nanoseconds.
@@ -349,6 +356,18 @@ test "SystemClock: multiple calls are non-decreasing" {
         try std.testing.expect(now >= prev);
         prev = now;
     }
+}
+
+fn makeSystemClock(io: std.Io) Clock {
+    return SystemClock.init(io).clock();
+}
+
+test "SystemClock: returned Clock owns movable Io state" {
+    const clock = makeSystemClock(std.testing.io);
+    const first = clock.now();
+    const second = clock.now();
+
+    try std.testing.expect(second >= first);
 }
 
 test "ManualClock: starts at zero" {

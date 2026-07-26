@@ -5,13 +5,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var sys = zimit.SystemClock.init(io);
-
-    var limiter = try zimit.RateLimiter([]const u8).init(.{
+    var limiter = try zimit.RateLimiter([]const u8).init(io, .{
         .allocator = gpa,
         .limit = .perSecond(5),
         .burst = 2,
-        .clock = sys.clock(),
     });
     defer limiter.deinit();
 

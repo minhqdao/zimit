@@ -13,8 +13,9 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
   - `wait(io, key)` → Blocks until allowed (uses `std.Io.sleep`)
   - `waitN(io, n)` / `waitN(io, key, n)` → Blocks until an entire batch is allowed; impossible batches return `error.BatchTooLarge`.
 - **Clocks:**
-  - `SystemClock` → Production monotonic clock (requires `std.process.Init.io`; uses Zig's `.awake` clock, matching limiter waits)
-  - `ManualClock` → Deterministic tests
+  - `init(io, config)` → Installs Zig's monotonic `.awake` clock automatically
+  - `initWithClock(config, clock)` → Injects a custom clock for deterministic tests
+  - `ManualClock` → Built-in manually controlled testing clock
 
 ## Usage
 
@@ -26,13 +27,10 @@ pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
 
-    var sys = zimit.SystemClock.init(io);
-
-    var limiter = try zimit.RateLimiter([]const u8).init(.{
+    var limiter = try zimit.RateLimiter([]const u8).init(io, .{
         .allocator = gpa,
         .limit = .perSecond(5),
         .burst = 2,
-        .clock = sys.clock(),
     });
     defer limiter.deinit();
 
