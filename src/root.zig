@@ -83,6 +83,12 @@ pub fn RateLimiterConfig(comptime K: type) type {
         burst: u32 = 0,
         /// Time source. Use `SystemClock` in production, `ManualClock` in tests.
         clock: Clock,
+        /// Maximum number of keys retained. `null` leaves the store unbounded.
+        max_entries: ?usize = null,
+        /// Remove fully-drained keys after this much inactivity.
+        /// Expired keys are reclaimed when a new key is inserted or by calling
+        /// `pruneExpired`.
+        idle_timeout_ns: ?i64 = null,
     };
 }
 
@@ -198,7 +204,16 @@ pub fn RateLimiter(comptime K: type) type {
                 .period_ns = cfg.per.toNs(),
             };
             return .{
-                .inner = try Inner.init(cfg.allocator, limit, cfg.burst, cfg.clock),
+                .inner = try Inner.initWithStorage(
+                    cfg.allocator,
+                    limit,
+                    cfg.burst,
+                    cfg.clock,
+                    .{
+                        .max_entries = cfg.max_entries,
+                        .idle_timeout_ns = cfg.idle_timeout_ns,
+                    },
+                ),
             };
         }
 
@@ -210,8 +225,8 @@ pub fn RateLimiter(comptime K: type) type {
         /// Check whether `key` may make one request right now.
         ///
         /// On `.allowed` the internal state is updated immediately.
-        /// On `.denied` no state changes — the caller should wait
-        /// `retry_after_ns` before calling again.
+        /// On `.denied` the rate state is unchanged, but the key's last-seen
+        /// time is refreshed when idle expiration is configured.
         pub fn allow(self: *Self, key: K) ZimitError!Outcome {
             return self.allowN(key, 1);
         }
@@ -252,6 +267,12 @@ pub fn RateLimiter(comptime K: type) type {
         pub fn keyCount(self: *const Self) usize {
             return self.inner.keyCount();
         }
+
+        /// Remove fully-drained keys whose idle timeout has elapsed.
+        /// Returns the number of keys removed.
+        pub fn pruneExpired(self: *Self) usize {
+            return self.inner.pruneExpired();
+        }
     };
 }
 
@@ -269,6 +290,21 @@ fn makeLimiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRate
         .per = per,
         .burst = burst,
         .clock = mc.clock(),
+    });
+}
+
+fn makeStoredLimiter(
+    max_entries: ?usize,
+    idle_timeout_ns: ?i64,
+    mc: *ManualClock,
+) !StringRateLimiter {
+    return StringRateLimiter.init(.{
+        .allocator = std.testing.allocator,
+        .rate = 1,
+        .per = .second,
+        .clock = mc.clock(),
+        .max_entries = max_entries,
+        .idle_timeout_ns = idle_timeout_ns,
     });
 }
 
@@ -596,6 +632,140 @@ test "RateLimiter: keyCount after mixed allow and remove" {
 
     lim.remove("b"); // second remove is safe
     try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
+}
+
+test "RateLimiter: max_entries rejects a new key at capacity" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(2, null, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    _ = try lim.allow("b");
+
+    try std.testing.expectError(error.CapacityExceeded, lim.allow("c"));
+    try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
+}
+
+test "RateLimiter: existing key remains usable at capacity" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(1, null, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    try std.testing.expect(!(try lim.allow("a")).isAllowed());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+}
+
+test "RateLimiter: max_entries zero rejects every new key" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(0, null, &mc);
+    defer lim.deinit();
+
+    try std.testing.expectError(error.CapacityExceeded, lim.allow("a"));
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+}
+
+test "RateLimiter: capacity automatically reclaims expired key" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    mc.tick(std.time.ns_per_s);
+
+    try std.testing.expect((try lim.allow("b")).isAllowed());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+    try std.testing.expectError(error.CapacityExceeded, lim.allow("a"));
+}
+
+test "RateLimiter: new key opportunistically reclaims expired entries" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(3, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    mc.tick(std.time.ns_per_s);
+
+    try std.testing.expect((try lim.allow("b")).isAllowed());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+}
+
+test "RateLimiter: pruneExpired removes all eligible keys" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(5, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    _ = try lim.allow("b");
+    _ = try lim.allow("c");
+    mc.tick(std.time.ns_per_s);
+
+    try std.testing.expectEqual(@as(usize, 3), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+}
+
+test "RateLimiter: pruneExpired preserves outstanding debt" {
+    var mc = ManualClock{};
+    var lim = try StringRateLimiter.init(.{
+        .allocator = std.testing.allocator,
+        .rate = 1,
+        .per = .second,
+        .burst = 2,
+        .clock = mc.clock(),
+        .max_entries = 1,
+        .idle_timeout_ns = std.time.ns_per_s,
+    });
+    defer lim.deinit();
+
+    try std.testing.expect((try lim.allowN("a", 3)).isAllowed());
+    mc.tick(2 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+
+    mc.tick(std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), lim.pruneExpired());
+}
+
+test "RateLimiter: denied attempt refreshes idle timeout" {
+    var mc = ManualClock{};
+    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    mc.tick(std.time.ns_per_s / 2);
+    try std.testing.expect(!(try lim.allow("a")).isAllowed());
+
+    mc.tick(std.time.ns_per_s / 2);
+    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+
+    mc.tick(std.time.ns_per_s / 2);
+    try std.testing.expectEqual(@as(usize, 1), lim.pruneExpired());
+}
+
+test "RateLimiter: pruneExpired ignores backward clock movement" {
+    var mc = ManualClock{};
+    mc.set(10 * std.time.ns_per_s);
+    var lim = try makeStoredLimiter(1, std.time.ns_per_s, &mc);
+    defer lim.deinit();
+
+    _ = try lim.allow("a");
+    mc.set(0);
+
+    try std.testing.expectEqual(@as(usize, 0), lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 1), lim.keyCount());
+}
+
+test "RateLimiter: init rejects non-positive idle timeout" {
+    var mc = ManualClock{};
+    try std.testing.expectError(
+        error.InvalidIdleTimeout,
+        makeStoredLimiter(1, 0, &mc),
+    );
+    try std.testing.expectError(
+        error.InvalidIdleTimeout,
+        makeStoredLimiter(1, -1, &mc),
+    );
 }
 
 test "RateLimiter: retry_after_ns is positive on denial" {

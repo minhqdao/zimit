@@ -11,6 +11,11 @@ pub const Decision = types.Decision;
 pub const Clock = types.Clock;
 pub const ZimitError = types.ZimitError;
 
+pub const StorageOptions = struct {
+    max_entries: ?usize = null,
+    idle_timeout_ns: ?i64 = null,
+};
+
 // ── Pure GCRA engine ──────────────────────────────────────────────────────────
 
 /// Run one GCRA check. Pure function — no allocations, no side effects.
@@ -110,7 +115,11 @@ fn deriveParameters(limit: Limit, burst: u32) ZimitError!Parameters {
 pub fn Limiter(comptime K: type) type {
     return struct {
         const Self = @This();
-        const Store = std.HashMap(K, i64, HashContext(K), 80);
+        const State = struct {
+            tat: i64,
+            last_seen_ns: i64,
+        };
+        const Store = std.HashMap(K, State, HashContext(K), 80);
 
         allocator: std.mem.Allocator,
         store: Store,
@@ -119,6 +128,9 @@ pub fn Limiter(comptime K: type) type {
         clock: Clock,
         max_batch: u64,
         burst_capacity: u64,
+        max_entries: ?usize,
+        idle_timeout_ns: ?i64,
+        next_prune_ns: i64,
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -126,6 +138,19 @@ pub fn Limiter(comptime K: type) type {
             burst: u32,
             clock: Clock,
         ) ZimitError!Self {
+            return initWithStorage(allocator, limit, burst, clock, .{});
+        }
+
+        pub fn initWithStorage(
+            allocator: std.mem.Allocator,
+            limit: Limit,
+            burst: u32,
+            clock: Clock,
+            storage: StorageOptions,
+        ) ZimitError!Self {
+            if (storage.idle_timeout_ns) |timeout| {
+                if (timeout <= 0) return error.InvalidIdleTimeout;
+            }
             const parameters = try deriveParameters(limit, burst);
             return .{
                 .allocator = allocator,
@@ -135,6 +160,9 @@ pub fn Limiter(comptime K: type) type {
                 .clock = clock,
                 .max_batch = parameters.max_batch,
                 .burst_capacity = parameters.burst_capacity,
+                .max_entries = storage.max_entries,
+                .idle_timeout_ns = storage.idle_timeout_ns,
+                .next_prune_ns = std.math.maxInt(i64),
             };
         }
 
@@ -160,7 +188,10 @@ pub fn Limiter(comptime K: type) type {
         /// If K is `[]const u8`, the key is duplicated and owned by the limiter
         /// if it's the first time we see it.
         pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
-            if (n == 0) return .{ .allowed = .{ .new_tat = self.store.get(key) orelse 0 } };
+            if (n == 0) {
+                const tat = if (self.store.get(key)) |state| state.tat else 0;
+                return .{ .allowed = .{ .new_tat = tat } };
+            }
 
             if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
                 return .{ .denied = .{ .retry_after_ns = std.math.maxInt(i64) } };
@@ -170,8 +201,9 @@ pub fn Limiter(comptime K: type) type {
 
             // Only lookup — never trust existing key memory
             if (self.store.getEntry(key)) |entry| {
+                entry.value_ptr.last_seen_ns = now;
                 const decision = checkN(
-                    entry.value_ptr.*,
+                    entry.value_ptr.tat,
                     now,
                     self.emission_interval_ns,
                     self.burst_offset_ns,
@@ -179,7 +211,7 @@ pub fn Limiter(comptime K: type) type {
                 );
 
                 if (decision == .allowed) {
-                    entry.value_ptr.* = decision.allowed.new_tat;
+                    entry.value_ptr.tat = decision.allowed.new_tat;
                 }
 
                 return decision;
@@ -194,6 +226,8 @@ pub fn Limiter(comptime K: type) type {
             );
 
             if (decision == .allowed) {
+                try self.maintainForNewKey(now);
+
                 const owned_key: K = if (K == []const u8)
                     try self.allocator.dupe(u8, key)
                 else
@@ -201,7 +235,14 @@ pub fn Limiter(comptime K: type) type {
 
                 errdefer if (K == []const u8) self.allocator.free(owned_key);
 
-                try self.store.put(owned_key, decision.allowed.new_tat);
+                try self.store.put(owned_key, .{
+                    .tat = decision.allowed.new_tat,
+                    .last_seen_ns = now,
+                });
+                self.schedulePrune(.{
+                    .tat = decision.allowed.new_tat,
+                    .last_seen_ns = now,
+                });
             }
 
             return decision;
@@ -222,6 +263,53 @@ pub fn Limiter(comptime K: type) type {
         /// Number of keys currently tracked in the store.
         pub fn keyCount(self: *const Self) usize {
             return self.store.count();
+        }
+
+        /// Remove entries that are idle and have no outstanding rate-limit debt.
+        /// Returns the number of entries removed.
+        pub fn pruneExpired(self: *Self) usize {
+            return self.pruneExpiredAt(self.clock.now());
+        }
+
+        fn maintainForNewKey(self: *Self, now: i64) ZimitError!void {
+            if (now >= self.next_prune_ns) {
+                _ = self.pruneExpiredAt(now);
+            }
+
+            const maximum = self.max_entries orelse return;
+            if (self.store.count() >= maximum) return error.CapacityExceeded;
+        }
+
+        fn pruneExpiredAt(self: *Self, now: i64) usize {
+            const timeout = self.idle_timeout_ns orelse return 0;
+            var removed: usize = 0;
+            self.next_prune_ns = std.math.maxInt(i64);
+            var iterator = self.store.iterator();
+
+            while (iterator.next()) |entry| {
+                const state = entry.value_ptr.*;
+                const idle_ns = @as(i128, now) - @as(i128, state.last_seen_ns);
+                if (state.tat > now or now < state.last_seen_ns or idle_ns < timeout) {
+                    self.schedulePrune(state);
+                    continue;
+                }
+
+                const owned_key = entry.key_ptr.*;
+                self.store.removeByPtr(entry.key_ptr);
+                if (K == []const u8) self.allocator.free(owned_key);
+                removed += 1;
+            }
+
+            return removed;
+        }
+
+        fn schedulePrune(self: *Self, state: State) void {
+            const timeout = self.idle_timeout_ns orelse return;
+            const idle_expiration = saturatingI64(
+                @as(i128, state.last_seen_ns) + @as(i128, timeout),
+            );
+            const candidate = @max(state.tat, idle_expiration);
+            self.next_prune_ns = @min(self.next_prune_ns, candidate);
         }
     };
 }

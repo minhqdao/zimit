@@ -162,6 +162,10 @@ pub const ZimitError = error{
     OutOfMemory,
     /// Derived time values cannot be represented in nanoseconds.
     TimeOverflow,
+    /// The keyed limiter has reached its configured entry limit.
+    CapacityExceeded,
+    /// The configured idle timeout is not positive.
+    InvalidIdleTimeout,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
