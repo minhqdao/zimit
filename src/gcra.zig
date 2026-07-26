@@ -11,6 +11,12 @@ pub const Decision = types.Decision;
 pub const Clock = types.Clock;
 pub const ZimitError = types.ZimitError;
 
+pub const Config = struct {
+    limit: Limit,
+    burst: u32 = 0,
+    clock: Clock,
+};
+
 pub const StorageOptions = struct {
     initial_capacity: u32 = 0,
     max_entries: ?usize = null,
@@ -90,6 +96,50 @@ const Parameters = struct {
     burst_capacity: u64,
 };
 
+const Engine = struct {
+    emission_interval_ns: i64,
+    burst_offset_ns: i64,
+    clock: Clock,
+    max_batch: u64,
+    burst_capacity: u64,
+
+    fn init(config: Config) ZimitError!Engine {
+        const parameters = try deriveParameters(config.limit, config.burst);
+        return .{
+            .emission_interval_ns = parameters.interval,
+            .burst_offset_ns = parameters.burst_offset,
+            .clock = config.clock,
+            .max_batch = parameters.max_batch,
+            .burst_capacity = parameters.burst_capacity,
+        };
+    }
+
+    fn allowsBatch(self: Engine, n: u32) bool {
+        return @as(u64, n) <= self.max_batch and
+            @as(u64, n) <= self.burst_capacity;
+    }
+
+    fn validateBatch(self: Engine, n: u32) ZimitError!void {
+        if (!self.allowsBatch(n)) return error.BatchTooLarge;
+    }
+
+    fn decide(self: Engine, tat: i64, now: i64, n: u32) Decision {
+        if (n == 0) return .{ .allowed = .{ .new_tat = tat } };
+        if (!self.allowsBatch(n)) {
+            return .{ .denied = .{
+                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
+            } };
+        }
+        return checkN(
+            tat,
+            now,
+            self.emission_interval_ns,
+            self.burst_offset_ns,
+            n,
+        );
+    }
+};
+
 fn deriveParameters(limit: Limit, burst: u32) ZimitError!Parameters {
     if (limit.count == 0 or limit.period_ns <= 0) return error.InvalidLimit;
     if (limit.count > limit.period_ns) return error.RateExceedsRes;
@@ -128,11 +178,7 @@ pub fn Limiter(comptime K: type) type {
 
         allocator: std.mem.Allocator,
         store: Store,
-        emission_interval_ns: i64,
-        burst_offset_ns: i64,
-        clock: Clock,
-        max_batch: u64,
-        burst_capacity: u64,
+        engine: Engine,
         max_entries: ?usize,
         idle_timeout_ns: ?i64,
         next_prune_ns: i64,
@@ -143,20 +189,29 @@ pub fn Limiter(comptime K: type) type {
             burst: u32,
             clock: Clock,
         ) ZimitError!Self {
-            return initWithStorage(allocator, limit, burst, clock, .{});
+            return initWithConfig(allocator, .{
+                .limit = limit,
+                .burst = burst,
+                .clock = clock,
+            });
         }
 
-        pub fn initWithStorage(
+        pub fn initWithConfig(
             allocator: std.mem.Allocator,
-            limit: Limit,
-            burst: u32,
-            clock: Clock,
+            config: Config,
+        ) ZimitError!Self {
+            return initWithConfigAndStorage(allocator, config, .{});
+        }
+
+        pub fn initWithConfigAndStorage(
+            allocator: std.mem.Allocator,
+            config: Config,
             storage: StorageOptions,
         ) ZimitError!Self {
             if (storage.idle_timeout_ns) |timeout| {
                 if (timeout <= 0) return error.InvalidIdleTimeout;
             }
-            const parameters = try deriveParameters(limit, burst);
+            const engine = try Engine.init(config);
             var store = Store.init(allocator);
             errdefer store.deinit();
 
@@ -169,11 +224,7 @@ pub fn Limiter(comptime K: type) type {
             return .{
                 .allocator = allocator,
                 .store = store,
-                .emission_interval_ns = parameters.interval,
-                .burst_offset_ns = parameters.burst_offset,
-                .clock = clock,
-                .max_batch = parameters.max_batch,
-                .burst_capacity = parameters.burst_capacity,
+                .engine = engine,
                 .max_entries = storage.max_entries,
                 .idle_timeout_ns = storage.idle_timeout_ns,
                 .next_prune_ns = std.math.maxInt(i64),
@@ -204,25 +255,18 @@ pub fn Limiter(comptime K: type) type {
         pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
             if (n == 0) {
                 const tat = if (self.store.get(key)) |state| state.tat else 0;
-                return .{ .allowed = .{ .new_tat = tat } };
+                return self.engine.decide(tat, 0, n);
             }
+            if (!self.engine.allowsBatch(n)) return self.engine.decide(0, 0, n);
 
-            if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
-                return .{ .denied = .{
-                    .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
-                } };
-            }
-
-            const now = self.clock.now();
+            const now = self.engine.clock.now();
 
             // Only lookup — never trust existing key memory
             if (self.store.getEntry(key)) |entry| {
                 entry.value_ptr.last_seen_ns = now;
-                const decision = checkN(
+                const decision = self.engine.decide(
                     entry.value_ptr.tat,
                     now,
-                    self.emission_interval_ns,
-                    self.burst_offset_ns,
                     n,
                 );
 
@@ -233,13 +277,7 @@ pub fn Limiter(comptime K: type) type {
                 return decision;
             }
 
-            const decision = checkN(
-                0,
-                now,
-                self.emission_interval_ns,
-                self.burst_offset_ns,
-                n,
-            );
+            const decision = self.engine.decide(0, now, n);
 
             if (decision == .allowed) {
                 try self.maintainForNewKey(now);
@@ -264,6 +302,10 @@ pub fn Limiter(comptime K: type) type {
             return decision;
         }
 
+        pub fn validateBatch(self: *const Self, n: u32) ZimitError!void {
+            return self.engine.validateBatch(n);
+        }
+
         /// Remove a key from the store.
         /// If K is a string type, also frees the copied key memory.
         pub fn remove(self: *Self, key: K) void {
@@ -284,7 +326,7 @@ pub fn Limiter(comptime K: type) type {
         /// Remove entries that are idle and have no outstanding rate-limit debt.
         /// Returns the number of entries removed.
         pub fn pruneExpired(self: *Self) usize {
-            return self.pruneExpiredAt(self.clock.now());
+            return self.pruneExpiredAt(self.engine.clock.now());
         }
 
         fn maintainForNewKey(self: *Self, now: i64) ZimitError!void {
@@ -353,27 +395,27 @@ fn HashContext(comptime K: type) type {
 /// a thread that loses a CAS race retries immediately with the freshly-loaded TAT.
 pub const AtomicLimiter = struct {
     tat: std.atomic.Value(i64),
-    emission_interval_ns: i64,
-    burst_offset_ns: i64,
-    clock: Clock,
-    max_batch: u64,
-    burst_capacity: u64,
+    engine: Engine,
 
     /// Initialise an atomic limiter.
     ///
-    ///   limit  The rate to enforce.
-    ///   burst  Extra requests allowed in a burst (0 = no burst).
-    ///   clock  Time source.
-    pub fn init(limit: Limit, burst: u32, clock: Clock) ZimitError!AtomicLimiter {
-        const parameters = try deriveParameters(limit, burst);
+    pub fn init(
+        limit: Limit,
+        burst: u32,
+        clock: Clock,
+    ) ZimitError!AtomicLimiter {
+        return initWithConfig(.{
+            .limit = limit,
+            .burst = burst,
+            .clock = clock,
+        });
+    }
 
+    /// Initialise from shared limiter configuration.
+    pub fn initWithConfig(config: Config) ZimitError!AtomicLimiter {
         return .{
             .tat = std.atomic.Value(i64).init(0),
-            .emission_interval_ns = parameters.interval,
-            .burst_offset_ns = parameters.burst_offset,
-            .clock = clock,
-            .max_batch = parameters.max_batch,
-            .burst_capacity = parameters.burst_capacity,
+            .engine = try Engine.init(config),
         };
     }
 
@@ -386,28 +428,16 @@ pub const AtomicLimiter = struct {
     /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
     /// are granted or none are — partial grants never occur.
     pub fn allowN(self: *AtomicLimiter, n: u32) Decision {
-        if (n == 0) {
-            return .{ .allowed = .{ .new_tat = self.tat.load(.monotonic) } };
+        if (n == 0 or !self.engine.allowsBatch(n)) {
+            return self.engine.decide(self.tat.load(.monotonic), 0, n);
         }
 
-        if (@as(u64, n) > self.max_batch or @as(u64, n) > self.burst_capacity) {
-            return .{ .denied = .{
-                .retry_after = .fromNanoseconds(std.math.maxInt(i64)),
-            } };
-        }
-
-        const now = self.clock.now();
+        const now = self.engine.clock.now();
 
         while (true) {
             const old_tat = self.tat.load(.monotonic);
 
-            const decision = checkN(
-                old_tat,
-                now,
-                self.emission_interval_ns,
-                self.burst_offset_ns,
-                n,
-            );
+            const decision = self.engine.decide(old_tat, now, n);
 
             switch (decision) {
                 .denied => return decision,
@@ -423,6 +453,10 @@ pub const AtomicLimiter = struct {
                 },
             }
         }
+    }
+
+    pub fn validateBatch(self: *const AtomicLimiter, n: u32) ZimitError!void {
+        return self.engine.validateBatch(n);
     }
 
     /// Reset the limiter to its initial state — useful in tests.
@@ -1465,8 +1499,8 @@ test "AtomicLimiter: allowN overflow guard denies without panic" {
     var lim = try AtomicLimiter.init(Limit.perSecond(10), 0, mc.clock());
 
     // max_batch = maxInt(i64) / 100_000_000 = 92, so 93 exceeds it
-    if (lim.max_batch >= std.math.maxInt(u32)) return; // avoid invalid cast
-    const n: u32 = @intCast(lim.max_batch + 1);
+    if (lim.engine.max_batch >= std.math.maxInt(u32)) return; // avoid invalid cast
+    const n: u32 = @intCast(lim.engine.max_batch + 1);
 
     const d = lim.allowN(n);
     try std.testing.expect(!d.isAllowed());
@@ -1478,7 +1512,7 @@ test "AtomicLimiter: allowN overflow guard leaves TAT unchanged" {
     var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
 
     const tat_before = lim.tat.load(.monotonic);
-    const n: u32 = @intCast(lim.max_batch + 1);
+    const n: u32 = @intCast(lim.engine.max_batch + 1);
     _ = lim.allowN(n);
 
     try std.testing.expectEqual(tat_before, lim.tat.load(.monotonic));
@@ -1489,7 +1523,7 @@ test "AtomicLimiter: allowN overflow guard returns maxInt retry_after" {
     mc.set(std.time.ns_per_s);
     var lim = try AtomicLimiter.init(Limit.perMinute(1), 0, mc.clock());
 
-    const n: u32 = @intCast(lim.max_batch + 1);
+    const n: u32 = @intCast(lim.engine.max_batch + 1);
     const d = lim.allowN(n);
 
     switch (d) {
@@ -1508,7 +1542,7 @@ test "AtomicLimiter: allowN large but valid n still works" {
     var lim = try AtomicLimiter.init(Limit.perMinute(1), 99, mc.clock());
 
     const n: u32 = 100;
-    try std.testing.expect(@as(u64, n) <= lim.max_batch);
+    try std.testing.expect(@as(u64, n) <= lim.engine.max_batch);
 
     // First call always allowed on a cold limiter — consume capacity
     _ = lim.allowN(n);
@@ -1532,7 +1566,7 @@ test "AtomicLimiter: allowN boundary exactly at max_batch does not overflow" {
         mc.clock(),
     );
 
-    const n: u32 = @intCast(lim.max_batch);
+    const n: u32 = @intCast(lim.engine.max_batch);
     const d = lim.allowN(n);
 
     // Guard must not have fired — if denied, retry must be finite
