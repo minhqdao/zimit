@@ -83,6 +83,8 @@ pub fn RateLimiterConfig(comptime K: type) type {
         burst: u32 = 0,
         /// Time source. Use `SystemClock` in production, `ManualClock` in tests.
         clock: Clock,
+        /// Reserve space for this many keys during initialization.
+        initial_capacity: u32 = 0,
         /// Maximum number of keys retained. `null` leaves the store unbounded.
         max_entries: ?usize = null,
         /// Remove fully-drained keys after this much inactivity.
@@ -210,6 +212,7 @@ pub fn RateLimiter(comptime K: type) type {
                     cfg.burst,
                     cfg.clock,
                     .{
+                        .initial_capacity = cfg.initial_capacity,
                         .max_entries = cfg.max_entries,
                         .idle_timeout_ns = cfg.idle_timeout_ns,
                     },
@@ -644,6 +647,37 @@ test "RateLimiter: max_entries rejects a new key at capacity" {
 
     try std.testing.expectError(error.CapacityExceeded, lim.allow("c"));
     try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
+}
+
+test "RateLimiter: initial_capacity reserves key storage" {
+    var mc = ManualClock{};
+    var lim = try StringRateLimiter.init(.{
+        .allocator = std.testing.allocator,
+        .rate = 1,
+        .per = .second,
+        .clock = mc.clock(),
+        .initial_capacity = 100,
+    });
+    defer lim.deinit();
+
+    try std.testing.expect(lim.inner.store.capacity() >= 100);
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+}
+
+test "RateLimiter: initial_capacity is limited by max_entries" {
+    var mc = ManualClock{};
+    var lim = try StringRateLimiter.init(.{
+        .allocator = std.testing.allocator,
+        .rate = 1,
+        .per = .second,
+        .clock = mc.clock(),
+        .initial_capacity = 100,
+        .max_entries = 2,
+    });
+    defer lim.deinit();
+
+    try std.testing.expect(lim.inner.store.capacity() >= 2);
+    try std.testing.expect(lim.inner.store.capacity() < 100);
 }
 
 test "RateLimiter: existing key remains usable at capacity" {

@@ -12,6 +12,7 @@ pub const Clock = types.Clock;
 pub const ZimitError = types.ZimitError;
 
 pub const StorageOptions = struct {
+    initial_capacity: u32 = 0,
     max_entries: ?usize = null,
     idle_timeout_ns: ?i64 = null,
 };
@@ -152,9 +153,18 @@ pub fn Limiter(comptime K: type) type {
                 if (timeout <= 0) return error.InvalidIdleTimeout;
             }
             const parameters = try deriveParameters(limit, burst);
+            var store = Store.init(allocator);
+            errdefer store.deinit();
+
+            const initial_capacity = if (storage.max_entries) |maximum|
+                @min(@as(usize, storage.initial_capacity), maximum)
+            else
+                storage.initial_capacity;
+            try store.ensureTotalCapacity(@intCast(initial_capacity));
+
             return .{
                 .allocator = allocator,
-                .store = Store.init(allocator),
+                .store = store,
                 .emission_interval_ns = parameters.interval,
                 .burst_offset_ns = parameters.burst_offset,
                 .clock = clock,
