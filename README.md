@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
         switch (try limiter.allow(key)) {
             .allowed => std.debug.print("allowed\n", .{}),
             .denied => |d| {
-                std.debug.print("denied, time until allowed: {d}ms\n", .{d.retry_after_ms_ceil()});
+                std.debug.print("denied, time until allowed: {d}ms\n", .{d.retryAfterMsCeil()});
             },
         }
     }
@@ -79,6 +79,24 @@ const exe = b.addExecutable(.{
     }),
 });
 ```
+
+## Format
+
+Format all Zig files before committing to prevent the CI from failing:
+
+```shell
+zig fmt src/ examples/ build.zig
+```
+
+## Linting
+
+Install ZLS 0.16.0 and ensure `zls` is available in `PATH`, then run:
+
+```shell
+python3 tools/zls_lint.py
+```
+
+The script sends every project Zig source file to ZLS and fails on any diagnostic, using the same results reported by editor integrations.
 
 ## License
 [MIT](LICENSE)

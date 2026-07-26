@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
         switch (limiter.allow()) {
             .allowed => std.debug.print("allowed\n", .{}),
             .denied => |d| {
-                std.debug.print("denied, time until allowed: {d} ms\n", .{d.retry_after_ms_ceil()});
+                std.debug.print("denied, time until allowed: {d} ms\n", .{d.retryAfterMsCeil()});
             },
         }
     }

@@ -27,7 +27,7 @@
 //!         switch (try limiter.allow(key)) {
 //!             .allowed => std.debug.print("allowed\n", .{}),
 //!             .denied => |d| {
-//!                 std.debug.print("denied, time until allowed: {d}ms\n", .{d.retry_after_ms_ceil()});
+//!                 std.debug.print("denied, time until allowed: {d}ms\n", .{d.retryAfterMsCeil()});
 //!             },
 //!         }
 //!     }
@@ -58,7 +58,7 @@ pub const Period = enum {
     hour,
 
     /// Converts the period to nanoseconds.
-    pub fn to_ns(self: Period) i64 {
+    pub fn toNs(self: Period) i64 {
         return switch (self) {
             .second => std.time.ns_per_s,
             .minute => 60 * std.time.ns_per_s,
@@ -88,7 +88,7 @@ pub fn RateLimiterConfig(comptime K: type) type {
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
 
-/// What the caller receives from `allow` / `allow_n`.
+/// What the caller receives from `allow` / `allowN`.
 /// Richer than a plain bool — carries the wait time so callers
 /// can implement backoff, 429 headers, or fiber suspension.
 pub const Outcome = union(enum) {
@@ -98,13 +98,13 @@ pub const Outcome = union(enum) {
         retry_after_ns: i64,
 
         /// Convenience: retry delay in whole milliseconds (rounded up).
-        pub fn retry_after_ms_ceil(self: @This()) i64 {
+        pub fn retryAfterMsCeil(self: @This()) i64 {
             return @divTrunc(self.retry_after_ns + 999_999, 1_000_000);
         }
     },
 
     /// Returns true if the outcome was allowed.
-    pub fn is_allowed(self: Outcome) bool {
+    pub fn isAllowed(self: Outcome) bool {
         return self == .allowed;
     }
 };
@@ -133,19 +133,19 @@ pub const GlobalLimiter = struct {
     }) ZimitError!GlobalLimiter {
         const limit = Limit{
             .count = cfg.rate,
-            .period_ns = cfg.per.to_ns(),
+            .period_ns = cfg.per.toNs(),
         };
         return .{ .inner = try gcra.AtomicLimiter.init(limit, cfg.burst, cfg.clock) };
     }
 
-    /// Convenience for `allow_n(1)`.
+    /// Convenience for `allowN(1)`.
     pub fn allow(self: *GlobalLimiter) Outcome {
-        return self.allow_n(1);
+        return self.allowN(1);
     }
 
     /// Atomically consume `n` slots.
-    pub fn allow_n(self: *GlobalLimiter, n: u32) Outcome {
-        return switch (self.inner.allow_n(n)) {
+    pub fn allowN(self: *GlobalLimiter, n: u32) Outcome {
+        return switch (self.inner.allowN(n)) {
             .allowed => .allowed,
             .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
         };
@@ -193,7 +193,7 @@ pub fn RateLimiter(comptime K: type) type {
         pub fn init(cfg: RateLimiterConfig(K)) ZimitError!Self {
             const limit = Limit{
                 .count = cfg.rate,
-                .period_ns = cfg.per.to_ns(),
+                .period_ns = cfg.per.toNs(),
             };
             return .{
                 .inner = try Inner.init(cfg.allocator, limit, cfg.burst, cfg.clock),
@@ -211,15 +211,15 @@ pub fn RateLimiter(comptime K: type) type {
         /// On `.denied` no state changes — the caller should wait
         /// `retry_after_ns` before calling again.
         pub fn allow(self: *Self, key: K) ZimitError!Outcome {
-            return self.allow_n(key, 1);
+            return self.allowN(key, 1);
         }
 
         /// Check whether `key` may make `n` requests atomically.
         ///
         /// All `n` slots are consumed together or none are — there is no
         /// partial allowance. Useful for batch jobs or chunked uploads.
-        pub fn allow_n(self: *Self, key: K, n: u32) ZimitError!Outcome {
-            return switch (try self.inner.check_key_n(key, n)) {
+        pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Outcome {
+            return switch (try self.inner.checkKeyN(key, n)) {
                 .allowed => .allowed,
                 .denied => |d| .{ .denied = .{ .retry_after_ns = d.retry_after_ns } },
             };
@@ -246,8 +246,8 @@ pub fn RateLimiter(comptime K: type) type {
         }
 
         /// Number of keys currently tracked.
-        pub fn key_count(self: *const Self) usize {
-            return self.inner.key_count();
+        pub fn keyCount(self: *const Self) usize {
+            return self.inner.keyCount();
         }
     };
 }
@@ -269,10 +269,10 @@ fn makeLimiter(rate: u32, per: Period, burst: u32, mc: *ManualClock) !StringRate
     });
 }
 
-test "Period.to_ns: values are correct" {
-    try std.testing.expectEqual(std.time.ns_per_s, Period.second.to_ns());
-    try std.testing.expectEqual(60 * std.time.ns_per_s, Period.minute.to_ns());
-    try std.testing.expectEqual(3600 * std.time.ns_per_s, Period.hour.to_ns());
+test "Period.toNs: values are correct" {
+    try std.testing.expectEqual(std.time.ns_per_s, Period.second.toNs());
+    try std.testing.expectEqual(60 * std.time.ns_per_s, Period.minute.toNs());
+    try std.testing.expectEqual(3600 * std.time.ns_per_s, Period.hour.toNs());
 }
 
 test "RateLimiter: allow — fresh key passes" {
@@ -282,7 +282,7 @@ test "RateLimiter: allow — fresh key passes" {
     defer lim.deinit();
 
     const out = try lim.allow("alice");
-    try std.testing.expect(out.is_allowed());
+    try std.testing.expect(out.isAllowed());
 }
 
 test "RateLimiter: allow — exhausted key is denied" {
@@ -295,10 +295,10 @@ test "RateLimiter: allow — exhausted key is denied" {
     _ = try lim.allow("u");
     _ = try lim.allow("u");
     const out = try lim.allow("u");
-    try std.testing.expect(!out.is_allowed());
+    try std.testing.expect(!out.isAllowed());
 }
 
-test "RateLimiter: allow — retry_after_ms_ceil rounds up" {
+test "RateLimiter: allow — retryAfterMsCeil rounds up" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // 1 req/s → emission interval = 1 000 000 000 ns = 1000 ms
@@ -311,7 +311,7 @@ test "RateLimiter: allow — retry_after_ms_ceil rounds up" {
         .denied => |d| {
             // retry_after_ns should be ~1s; ms should round up to 1000
             try std.testing.expect(d.retry_after_ns > 0);
-            try std.testing.expectEqual(@as(i64, 1000), d.retry_after_ms_ceil());
+            try std.testing.expectEqual(@as(i64, 1000), d.retryAfterMsCeil());
         },
         .allowed => return error.TestUnexpectedResult,
     }
@@ -325,7 +325,7 @@ test "RateLimiter: allow — keys are isolated" {
 
     _ = try lim.allow("alice");
     const bob = try lim.allow("bob");
-    try std.testing.expect(bob.is_allowed());
+    try std.testing.expect(bob.isAllowed());
 }
 
 test "RateLimiter: allow — time advance unblocks key" {
@@ -335,10 +335,10 @@ test "RateLimiter: allow — time advance unblocks key" {
     defer lim.deinit();
 
     _ = try lim.allow("u");
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     mc.tick(std.time.ns_per_s);
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: burst — allows base+burst requests at t=0" {
@@ -351,9 +351,9 @@ test "RateLimiter: burst — allows base+burst requests at t=0" {
     var i: usize = 0;
     while (i < 4) : (i += 1) {
         const out = try lim.allow("u");
-        try std.testing.expectEqual(true, out.is_allowed());
+        try std.testing.expectEqual(true, out.isAllowed());
     }
-    try std.testing.expectEqual(false, (try lim.allow("u")).is_allowed());
+    try std.testing.expectEqual(false, (try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: burst — replenishes after delay" {
@@ -365,14 +365,14 @@ test "RateLimiter: burst — replenishes after delay" {
     // Consume both base + burst
     _ = try lim.allow("u");
     _ = try lim.allow("u");
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // One second later, one slot has replenished
     mc.tick(std.time.ns_per_s);
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
-test "RateLimiter: allow_n — consume multiple slots atomically" {
+test "RateLimiter: allowN — consume multiple slots atomically" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=10/s, no burst → 10 slots available at t=0
@@ -380,15 +380,15 @@ test "RateLimiter: allow_n — consume multiple slots atomically" {
     defer lim.deinit();
 
     // Consume 7 — succeeds
-    try std.testing.expectEqual(true, (try lim.allow_n("u", 7)).is_allowed());
+    try std.testing.expectEqual(true, (try lim.allowN("u", 7)).isAllowed());
     // Only 3 remain — requesting 4 fails
-    try std.testing.expectEqual(false, (try lim.allow_n("u", 4)).is_allowed());
+    try std.testing.expectEqual(false, (try lim.allowN("u", 4)).isAllowed());
     // 3 remaining still there — fails too, TAT is already 700ms out
     // and no burst to cover the gap for a further n=3 at t=0
-    try std.testing.expectEqual(false, (try lim.allow_n("u", 3)).is_allowed());
+    try std.testing.expectEqual(false, (try lim.allowN("u", 3)).isAllowed());
 }
 
-test "RateLimiter: allow_n — n=0 always allowed without state change" {
+test "RateLimiter: allowN — n=0 always allowed without state change" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(1, .second, 0, &mc);
@@ -396,32 +396,32 @@ test "RateLimiter: allow_n — n=0 always allowed without state change" {
 
     // Exhaust the key
     _ = try lim.allow("u");
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // n=0 should still return allowed and not mutate state
-    try std.testing.expect((try lim.allow_n("u", 0)).is_allowed());
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allowN("u", 0)).isAllowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 }
 
-test "RateLimiter: allow_n — partial batch is never granted" {
+test "RateLimiter: allowN — partial batch is never granted" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(5, .second, 0, &mc);
     defer lim.deinit();
 
     // Consume 3 slots atomically — succeeds, TAT now 600ms out
-    try std.testing.expectEqual(true, (try lim.allow_n("u", 3)).is_allowed());
+    try std.testing.expectEqual(true, (try lim.allowN("u", 3)).isAllowed());
 
     // Request 10 more — way over limit, must fail
-    try std.testing.expectEqual(false, (try lim.allow_n("u", 10)).is_allowed());
+    try std.testing.expectEqual(false, (try lim.allowN("u", 10)).isAllowed());
 
     // Advance time by 600ms — exactly the 3 slots we consumed
     mc.tick(600 * std.time.ns_per_ms);
 
     // TAT is now at 1600ms, time is at 1600ms — key is fresh again.
-    // If allow_n had partially mutated state on the failed n=10 attempt,
+    // If allowN had partially mutated state on the failed n=10 attempt,
     // the TAT would be further ahead and this would fail.
-    try std.testing.expectEqual(true, (try lim.allow_n("u", 5)).is_allowed());
+    try std.testing.expectEqual(true, (try lim.allowN("u", 5)).isAllowed());
 }
 
 test "RateLimiter: remove — resets key to fresh" {
@@ -431,11 +431,11 @@ test "RateLimiter: remove — resets key to fresh" {
     defer lim.deinit();
 
     _ = try lim.allow("u");
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     lim.remove("u");
-    try std.testing.expectEqual(@as(usize, 0), lim.key_count());
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: per minute config" {
@@ -446,11 +446,11 @@ test "RateLimiter: per minute config" {
 
     // 60/min = 1/s — second request at same instant denied
     _ = try lim.allow("u");
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // Advance 1 second → allowed again
     mc.tick(std.time.ns_per_s);
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
 test "RateLimiter: integer key type (u64)" {
@@ -465,10 +465,10 @@ test "RateLimiter: integer key type (u64)" {
     });
     defer lim.deinit();
 
-    try std.testing.expect((try lim.allow(1001)).is_allowed());
-    try std.testing.expect((try lim.allow(1002)).is_allowed());
+    try std.testing.expect((try lim.allow(1001)).isAllowed());
+    try std.testing.expect((try lim.allow(1002)).isAllowed());
     // Same key, second request — denied
-    try std.testing.expect(!(try lim.allow_n(1001, 5)).is_allowed());
+    try std.testing.expect(!(try lim.allowN(1001, 5)).isAllowed());
 }
 
 test "RateLimiter: sustained throughput over simulated minute" {
@@ -481,13 +481,13 @@ test "RateLimiter: sustained throughput over simulated minute" {
     // 60 seconds, one attempt every 5ms (12 000 attempts total)
     while (t < 60 * std.time.ns_per_s) : (t += 5_000_000) {
         mc.set(t);
-        if ((try lim.allow("u")).is_allowed()) allowed += 1;
+        if ((try lim.allow("u")).isAllowed()) allowed += 1;
     }
     // Expect exactly 6 000 allowed (100/s × 60s)
     try std.testing.expectEqual(@as(usize, 6_000), allowed);
 }
 
-test "RateLimiter: allow_n overflow guard denies without panic" {
+test "RateLimiter: allowN overflow guard denies without panic" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // per=minute, rate=1 → interval=60_000_000_000 ns → max_batch=153
@@ -495,17 +495,17 @@ test "RateLimiter: allow_n overflow guard denies without panic" {
     var lim = try makeLimiter(1, .minute, 0, &mc);
     defer lim.deinit();
 
-    const out = try lim.allow_n("u", std.math.maxInt(u32));
-    try std.testing.expect(!out.is_allowed());
+    const out = try lim.allowN("u", std.math.maxInt(u32));
+    try std.testing.expect(!out.isAllowed());
 }
 
-test "RateLimiter: allow_n overflow guard returns maxInt retry_after" {
+test "RateLimiter: allowN overflow guard returns maxInt retry_after" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(1, .minute, 0, &mc);
     defer lim.deinit();
 
-    const out = try lim.allow_n("u", std.math.maxInt(u32));
+    const out = try lim.allowN("u", std.math.maxInt(u32));
     switch (out) {
         .denied => |d| try std.testing.expectEqual(
             @as(i64, std.math.maxInt(i64)),
@@ -515,33 +515,33 @@ test "RateLimiter: allow_n overflow guard returns maxInt retry_after" {
     }
 }
 
-test "RateLimiter: allow_n overflow guard does not mutate state" {
+test "RateLimiter: allowN overflow guard does not mutate state" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(1, .minute, 0, &mc);
     defer lim.deinit();
 
-    _ = try lim.allow_n("u", std.math.maxInt(u32));
+    _ = try lim.allowN("u", std.math.maxInt(u32));
 
     const out = try lim.allow("u");
-    try std.testing.expect(out.is_allowed());
+    try std.testing.expect(out.isAllowed());
 }
 
-test "RateLimiter: allow_n large but valid n is evaluated normally" {
+test "RateLimiter: allowN large but valid n is evaluated normally" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     // rate=10/s → interval=100ms → max_batch=92, so n=5 is valid
     var lim = try makeLimiter(10, .second, 0, &mc);
     defer lim.deinit();
 
-    const out = try lim.allow_n("u", 5);
+    const out = try lim.allowN("u", 5);
     switch (out) {
         .allowed => {},
         .denied => |d| try std.testing.expect(d.retry_after_ns < std.math.maxInt(i64)),
     }
 }
 
-test "RateLimiter: allow_n — n=1 and allow are equivalent" {
+test "RateLimiter: allowN — n=1 and allow are equivalent" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim_a = try makeLimiter(5, .second, 0, &mc);
@@ -552,8 +552,8 @@ test "RateLimiter: allow_n — n=1 and allow are equivalent" {
     var i: usize = 0;
     while (i < 6) : (i += 1) {
         const a = try lim_a.allow("u");
-        const b = try lim_b.allow_n("u", 1);
-        try std.testing.expectEqual(a.is_allowed(), b.is_allowed());
+        const b = try lim_b.allowN("u", 1);
+        try std.testing.expectEqual(a.isAllowed(), b.isAllowed());
     }
 }
 
@@ -564,10 +564,10 @@ test "RateLimiter: remove on absent key is safe" {
     defer lim.deinit();
 
     lim.remove("ghost");
-    try std.testing.expectEqual(@as(usize, 0), lim.key_count());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
 }
 
-test "RateLimiter: key_count after mixed allow and remove" {
+test "RateLimiter: keyCount after mixed allow and remove" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(10, .second, 0, &mc);
@@ -576,13 +576,13 @@ test "RateLimiter: key_count after mixed allow and remove" {
     _ = try lim.allow("a");
     _ = try lim.allow("b");
     _ = try lim.allow("c");
-    try std.testing.expectEqual(@as(usize, 3), lim.key_count());
+    try std.testing.expectEqual(@as(usize, 3), lim.keyCount());
 
     lim.remove("b");
-    try std.testing.expectEqual(@as(usize, 2), lim.key_count());
+    try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
 
     lim.remove("b"); // second remove is safe
-    try std.testing.expectEqual(@as(usize, 2), lim.key_count());
+    try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
 }
 
 test "RateLimiter: retry_after_ns is positive on denial" {
@@ -659,14 +659,14 @@ test "RateLimiter: stress — 10k unique keys" {
 
     var i: u32 = 0;
     while (i < 10_000) : (i += 1) {
-        try std.testing.expect((try lim.allow(i)).is_allowed());
+        try std.testing.expect((try lim.allow(i)).isAllowed());
     }
-    try std.testing.expectEqual(@as(usize, 10_000), lim.key_count());
+    try std.testing.expectEqual(@as(usize, 10_000), lim.keyCount());
 
     // Second pass — all must be denied (rate is 1/hour)
     i = 0;
     while (i < 10_000) : (i += 1) {
-        try std.testing.expect(!(try lim.allow(i)).is_allowed());
+        try std.testing.expect(!(try lim.allow(i)).isAllowed());
     }
 }
 
@@ -710,25 +710,25 @@ test "RateLimiter: per-hour config with burst and time advance" {
     defer lim.deinit();
 
     // 2 requests pass (1 base + 1 burst)
-    try std.testing.expect((try lim.allow("u")).is_allowed());
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
     // Third denied
-    try std.testing.expect(!(try lim.allow("u")).is_allowed());
+    try std.testing.expect(!(try lim.allow("u")).isAllowed());
 
     // Advance 1 hour → 1 slot replenished
     mc.tick(3600 * std.time.ns_per_s);
-    try std.testing.expect((try lim.allow("u")).is_allowed());
+    try std.testing.expect((try lim.allow("u")).isAllowed());
 }
 
-test "RateLimiter: allow_n with n=0 on exhausted key returns allowed" {
+test "RateLimiter: allowN with n=0 on exhausted key returns allowed" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try makeLimiter(1, .second, 0, &mc);
     defer lim.deinit();
 
     _ = try lim.allow("u"); // exhaust
-    try std.testing.expect(!(try lim.allow("u")).is_allowed()); // confirm exhausted
-    try std.testing.expect((try lim.allow_n("u", 0)).is_allowed()); // n=0 still allowed
+    try std.testing.expect(!(try lim.allow("u")).isAllowed()); // confirm exhausted
+    try std.testing.expect((try lim.allowN("u", 0)).isAllowed()); // n=0 still allowed
 }
 
 test "RateLimiter: multiple keys with different burst behavior" {
@@ -738,16 +738,16 @@ test "RateLimiter: multiple keys with different burst behavior" {
     defer lim.deinit();
 
     // key "a" uses all burst: 3 requests (1 base + 2 burst)
-    try std.testing.expect((try lim.allow("a")).is_allowed());
-    try std.testing.expect((try lim.allow("a")).is_allowed());
-    try std.testing.expect((try lim.allow("a")).is_allowed());
-    try std.testing.expect(!(try lim.allow("a")).is_allowed());
+    try std.testing.expect((try lim.allow("a")).isAllowed());
+    try std.testing.expect((try lim.allow("a")).isAllowed());
+    try std.testing.expect((try lim.allow("a")).isAllowed());
+    try std.testing.expect(!(try lim.allow("a")).isAllowed());
 
     // key "b" is independent — still has full burst capacity
-    try std.testing.expect((try lim.allow("b")).is_allowed());
-    try std.testing.expect((try lim.allow("b")).is_allowed());
-    try std.testing.expect((try lim.allow("b")).is_allowed());
-    try std.testing.expect(!(try lim.allow("b")).is_allowed());
+    try std.testing.expect((try lim.allow("b")).isAllowed());
+    try std.testing.expect((try lim.allow("b")).isAllowed());
+    try std.testing.expect((try lim.allow("b")).isAllowed());
+    try std.testing.expect(!(try lim.allow("b")).isAllowed());
 }
 
 test "RateLimiter: StringRateLimiter type alias works" {
@@ -762,7 +762,7 @@ test "RateLimiter: StringRateLimiter type alias works" {
     });
     defer lim.deinit();
 
-    try std.testing.expect((try lim.allow("test")).is_allowed());
+    try std.testing.expect((try lim.allow("test")).isAllowed());
 }
 
 test "GlobalLimiter: concurrent contention" {
@@ -783,7 +783,7 @@ test "GlobalLimiter: concurrent contention" {
 
         fn run(ctx: *@This()) void {
             while (true) {
-                if (ctx.limiter.allow().is_allowed()) {
+                if (ctx.limiter.allow().isAllowed()) {
                     _ = ctx.allowed.fetchAdd(1, .monotonic);
                 } else break;
             }
@@ -816,9 +816,9 @@ test "GlobalLimiter: basic allow and deny" {
 
     var i: usize = 0;
     while (i < 5) : (i += 1) {
-        try std.testing.expectEqual(true, lim.allow().is_allowed());
+        try std.testing.expectEqual(true, lim.allow().isAllowed());
     }
-    try std.testing.expectEqual(false, lim.allow().is_allowed());
+    try std.testing.expectEqual(false, lim.allow().isAllowed());
 }
 
 test "GlobalLimiter: reset restores capacity" {
@@ -832,9 +832,9 @@ test "GlobalLimiter: reset restores capacity" {
     });
 
     _ = lim.allow();
-    try std.testing.expectEqual(false, lim.allow().is_allowed());
+    try std.testing.expectEqual(false, lim.allow().isAllowed());
     lim.reset();
-    try std.testing.expectEqual(true, lim.allow().is_allowed());
+    try std.testing.expectEqual(true, lim.allow().isAllowed());
 }
 
 test "GlobalLimiter: wait blocks and eventually succeeds" {
@@ -851,7 +851,7 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     while (i < 10) : (i += 1) {
         _ = lim.allow();
     }
-    try std.testing.expectEqual(false, lim.allow().is_allowed());
+    try std.testing.expectEqual(false, lim.allow().isAllowed());
 
     const start = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
     try lim.wait(std.testing.io); // should block for roughly 100ms
@@ -860,7 +860,7 @@ test "GlobalLimiter: wait blocks and eventually succeeds" {
     try std.testing.expect(end - start >= 50); // allow some slack
 }
 
-test "GlobalLimiter: allow_n batch" {
+test "GlobalLimiter: allowN batch" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.init(.{
@@ -870,11 +870,11 @@ test "GlobalLimiter: allow_n batch" {
         .clock = mc.clock(),
     });
 
-    try std.testing.expectEqual(true, lim.allow_n(8).is_allowed());
-    try std.testing.expectEqual(false, lim.allow_n(4).is_allowed());
+    try std.testing.expectEqual(true, lim.allowN(8).isAllowed());
+    try std.testing.expectEqual(false, lim.allowN(4).isAllowed());
 }
 
-test "GlobalLimiter: retry_after_ms_ceil is non-zero on denial" {
+test "GlobalLimiter: retryAfterMsCeil is non-zero on denial" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.init(.{
@@ -886,12 +886,12 @@ test "GlobalLimiter: retry_after_ms_ceil is non-zero on denial" {
 
     _ = lim.allow();
     switch (lim.allow()) {
-        .denied => |d| try std.testing.expect(d.retry_after_ms_ceil() > 0),
+        .denied => |d| try std.testing.expect(d.retryAfterMsCeil() > 0),
         .allowed => return error.TestUnexpectedResult,
     }
 }
 
-test "GlobalLimiter: allow_n overflow guard" {
+test "GlobalLimiter: allowN overflow guard" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.init(.{
@@ -901,8 +901,8 @@ test "GlobalLimiter: allow_n overflow guard" {
         .clock = mc.clock(),
     });
 
-    const out = lim.allow_n(std.math.maxInt(u32));
-    try std.testing.expect(!out.is_allowed());
+    const out = lim.allowN(std.math.maxInt(u32));
+    try std.testing.expect(!out.isAllowed());
     switch (out) {
         .denied => |d| try std.testing.expectEqual(
             @as(i64, std.math.maxInt(i64)),
@@ -912,7 +912,7 @@ test "GlobalLimiter: allow_n overflow guard" {
     }
 }
 
-test "GlobalLimiter: allow_n overflow guard does not mutate state" {
+test "GlobalLimiter: allowN overflow guard does not mutate state" {
     var mc = ManualClock{};
     mc.set(std.time.ns_per_s);
     var lim = try GlobalLimiter.init(.{
@@ -922,41 +922,41 @@ test "GlobalLimiter: allow_n overflow guard does not mutate state" {
         .clock = mc.clock(),
     });
 
-    _ = lim.allow_n(std.math.maxInt(u32));
+    _ = lim.allowN(std.math.maxInt(u32));
     // Normal request should still work
-    try std.testing.expect(lim.allow().is_allowed());
+    try std.testing.expect(lim.allow().isAllowed());
 }
 
-test "Outcome: retry_after_ms_ceil rounds up from 1ns" {
+test "Outcome: retryAfterMsCeil rounds up from 1ns" {
     // 1 ns → ceil(1 / 1_000_000) = 1 ms
     const outcome = Outcome{ .denied = .{ .retry_after_ns = 1 } };
     switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 1), d.retry_after_ms_ceil()),
+        .denied => |d| try std.testing.expectEqual(@as(i64, 1), d.retryAfterMsCeil()),
         .allowed => return error.TestUnexpectedResult,
     }
 }
 
-test "Outcome: retry_after_ms_ceil exact millisecond boundary" {
+test "Outcome: retryAfterMsCeil exact millisecond boundary" {
     // Exactly 5ms = 5_000_000 ns → should be 5ms, not 6ms
     const outcome = Outcome{ .denied = .{ .retry_after_ns = 5_000_000 } };
     switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 5), d.retry_after_ms_ceil()),
+        .denied => |d| try std.testing.expectEqual(@as(i64, 5), d.retryAfterMsCeil()),
         .allowed => return error.TestUnexpectedResult,
     }
 }
 
-test "Outcome: retry_after_ms_ceil just over boundary" {
+test "Outcome: retryAfterMsCeil just over boundary" {
     // 5_000_001 ns → ceil = 6ms
     const outcome = Outcome{ .denied = .{ .retry_after_ns = 5_000_001 } };
     switch (outcome) {
-        .denied => |d| try std.testing.expectEqual(@as(i64, 6), d.retry_after_ms_ceil()),
+        .denied => |d| try std.testing.expectEqual(@as(i64, 6), d.retryAfterMsCeil()),
         .allowed => return error.TestUnexpectedResult,
     }
 }
 
-test "Outcome: is_allowed matches tagged union" {
+test "Outcome: isAllowed matches tagged union" {
     const allowed = Outcome{ .allowed = {} };
     const denied = Outcome{ .denied = .{ .retry_after_ns = 42 } };
-    try std.testing.expect(allowed.is_allowed());
-    try std.testing.expect(!denied.is_allowed());
+    try std.testing.expect(allowed.isAllowed());
+    try std.testing.expect(!denied.isAllowed());
 }
