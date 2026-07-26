@@ -1,54 +1,58 @@
 //! Core types for zimit.
-//! This file has zero dependencies on the GCRA engine or the standard library's
-//! time functions — all time values are plain i64 nanoseconds, injectable by callers.
+//! This file has zero dependencies on the GCRA engine. Public time values use
+//! Zig's `std.Io.Duration` and `std.Io.Timestamp`.
 
 const std = @import("std");
 
 // ── Limit ────────────────────────────────────────────────────────────────────
 
-/// Describes a rate: `count` requests allowed per `period` nanoseconds.
+/// Describes a rate: `count` requests allowed per `period`.
 ///
 /// Example:
 ///     const limit = Limit.perSecond(100);      // 100 req/s
 ///     const limit = Limit.perMinute(1000);     // 1 000 req/min
-///     const limit = Limit{ .count = 5, .period_ns = 2 * std.time.ns_per_s }; // 5 req/2s
+///     const limit = Limit{ .count = 5, .period = .fromSeconds(2) }; // 5 req/2s
 pub const Limit = struct {
     /// Number of requests allowed per period.
     count: u32,
-    /// Duration of the period in nanoseconds.
-    period_ns: i64,
+    /// Duration of the period.
+    period: std.Io.Duration,
 
-    /// Derived: nanoseconds between each emission (period / count).
+    /// Derived duration between each emission (period / count).
     /// This is the fundamental GCRA unit — one "slot" of time.
-    /// Returns 0 when `count` is 0; limiter initialization rejects that limit.
-    pub fn emissionInterval(self: Limit) i64 {
-        if (self.count == 0) return 0;
-        return @divTrunc(self.period_ns, @as(i64, self.count));
+    /// Returns `.zero` when `count` is 0; initialization rejects that limit.
+    pub fn emissionInterval(self: Limit) std.Io.Duration {
+        if (self.count == 0) return .zero;
+        return .fromNanoseconds(
+            @divTrunc(self.period.toNanoseconds(), @as(i96, self.count)),
+        );
     }
 
-    /// Nanoseconds a burst of `burst` extra requests buys you.
+    /// Duration a burst of `burst` extra requests buys you.
     /// In GCRA terms: how far in the past the TAT may be before we reject.
-    /// Saturates at the `i64` bounds; limiter initialization reports
-    /// `error.TimeOverflow` instead of accepting a saturated burst offset.
-    pub fn burstOffset(self: Limit, burst: u32) i64 {
-        return self.emissionInterval() *| @as(i64, burst);
+    /// Saturates at the `std.Io.Duration` bounds; limiter initialization
+    /// reports `error.TimeOverflow` if its internal representation is narrower.
+    pub fn burstOffset(self: Limit, burst: u32) std.Io.Duration {
+        return .fromNanoseconds(
+            self.emissionInterval().toNanoseconds() *| @as(i96, burst),
+        );
     }
 
     // ── Convenience constructors ────────────────────────────────────────────
 
     /// `count` requests per second.
     pub fn perSecond(count: u32) Limit {
-        return .{ .count = count, .period_ns = std.time.ns_per_s };
+        return .{ .count = count, .period = .fromSeconds(1) };
     }
 
     /// `count` requests per minute.
     pub fn perMinute(count: u32) Limit {
-        return .{ .count = count, .period_ns = 60 * std.time.ns_per_s };
+        return .{ .count = count, .period = .fromSeconds(60) };
     }
 
     /// `count` requests per hour.
     pub fn perHour(count: u32) Limit {
-        return .{ .count = count, .period_ns = 3600 * std.time.ns_per_s };
+        return .{ .count = count, .period = .fromSeconds(3600) };
     }
 };
 
@@ -139,7 +143,8 @@ pub const SystemClock = struct {
 };
 
 /// A manually-advanced clock for deterministic tests.
-/// Call `.tick(ns)` to advance time; call `.set(ns)` to jump to an absolute time.
+/// Call `.tick(duration)` to advance time; call `.set(timestamp)` to jump to
+/// an absolute time.
 pub const ManualClock = struct {
     time_ns: i64 = 0,
 
@@ -148,29 +153,39 @@ pub const ManualClock = struct {
         return .{ .custom = .{ .ptr = self, .now_fn = nowImpl } };
     }
 
-    /// Sets the clock to an absolute time in nanoseconds.
-    pub fn set(self: *ManualClock, ns: i64) void {
-        self.time_ns = ns;
+    /// Sets the clock to an absolute timestamp.
+    pub fn set(self: *ManualClock, timestamp: std.Io.Timestamp) void {
+        self.time_ns = clampI64(timestamp.toNanoseconds());
     }
 
-    /// Advances the clock by a duration in nanoseconds.
+    /// Advances the clock by a duration.
     /// Saturates at the `i64` bounds instead of overflowing.
-    pub fn tick(self: *ManualClock, ns: i64) void {
-        self.time_ns +|= ns;
+    pub fn tick(self: *ManualClock, duration: std.Io.Duration) void {
+        self.time_ns = clampI64(
+            @as(i96, self.time_ns) + duration.toNanoseconds(),
+        );
     }
 
     fn nowImpl(ptr: *anyopaque) i64 {
         const self: *ManualClock = @ptrCast(@alignCast(ptr));
         return self.time_ns;
     }
+
+    fn clampI64(value: i96) i64 {
+        return @intCast(std.math.clamp(
+            value,
+            std.math.minInt(i64),
+            std.math.maxInt(i64),
+        ));
+    }
 };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 pub const ZimitError = error{
-    /// count or period_ns is zero — would produce a zero emission interval.
+    /// count or period is zero — would produce a zero emission interval.
     InvalidLimit,
-    /// count > period_ns — rate is > 1 req/ns, which exceeds resolution.
+    /// count exceeds the period's nanoseconds — rate is > 1 req/ns.
     RateExceedsRes,
     /// Out of memory when inserting a new key into the store.
     OutOfMemory,
@@ -190,59 +205,62 @@ pub const ZimitError = error{
 
 test "Limit.emissionInterval: 100 req/s → 10ms" {
     const l = Limit.perSecond(100);
-    try std.testing.expectEqual(@as(i64, 10_000_000), l.emissionInterval());
+    try std.testing.expectEqual(@as(i96, 10_000_000), l.emissionInterval().toNanoseconds());
 }
 
 test "Limit.emissionInterval: 1 req/s → 1s" {
     const l = Limit.perSecond(1);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_s), l.emissionInterval().toNanoseconds());
 }
 
 test "Limit.burstOffset: 100 req/s burst=10 → 100ms" {
     const l = Limit.perSecond(100);
-    try std.testing.expectEqual(@as(i64, 100_000_000), l.burstOffset(10));
+    try std.testing.expectEqual(@as(i96, 100_000_000), l.burstOffset(10).toNanoseconds());
 }
 
 test "Limit.burstOffset: no burst → 0" {
     const l = Limit.perSecond(50);
-    try std.testing.expectEqual(@as(i64, 0), l.burstOffset(0));
+    try std.testing.expectEqual(@as(i96, 0), l.burstOffset(0).toNanoseconds());
 }
 
 test "Limit.emissionInterval: zero count is non-trapping" {
-    const limit = Limit{ .count = 0, .period_ns = std.time.ns_per_s };
-    try std.testing.expectEqual(@as(i64, 0), limit.emissionInterval());
+    const limit = Limit{ .count = 0, .period = .fromNanoseconds(std.time.ns_per_s) };
+    try std.testing.expectEqual(@as(i96, 0), limit.emissionInterval().toNanoseconds());
 }
 
-test "Limit.burstOffset: saturates on overflow" {
-    const limit = Limit{ .count = 1, .period_ns = std.math.maxInt(i64) };
+test "Limit.burstOffset: uses Duration's wider representation" {
+    const limit = Limit{ .count = 1, .period = .fromNanoseconds(std.math.maxInt(i64)) };
     try std.testing.expectEqual(
-        @as(i64, std.math.maxInt(i64)),
-        limit.burstOffset(2),
+        @as(i96, std.math.maxInt(i64)) * 2,
+        limit.burstOffset(2).toNanoseconds(),
     );
 }
 
 test "Limit.perMinute: 60 req/min → 1s emission interval" {
     const l = Limit.perMinute(60);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_s), l.emissionInterval().toNanoseconds());
 }
 
 test "Limit.perHour: 3600 req/h → 1s emission interval" {
     const l = Limit.perHour(3600);
-    try std.testing.expectEqual(std.time.ns_per_s, l.emissionInterval());
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_s), l.emissionInterval().toNanoseconds());
 }
 
 test "Limit.perHour: 1 req/h → 1 hour emission interval" {
     const l = Limit.perHour(1);
-    try std.testing.expectEqual(@as(i64, 3600 * std.time.ns_per_s), l.emissionInterval());
+    try std.testing.expectEqual(
+        @as(i96, 3600 * std.time.ns_per_s),
+        l.emissionInterval().toNanoseconds(),
+    );
 }
 
 test "Limit.emissionInterval: large count does not overflow" {
     // maxInt(u32) = 4_294_967_295
-    // period_ns = 1_000_000_000 (1s)
+    // period = 1_000_000_000ns (1s)
     // interval = 1_000_000_000 / 4_294_967_295 = 0 (integer truncation)
     const l = Limit.perSecond(std.math.maxInt(u32));
     const interval = l.emissionInterval();
-    try std.testing.expect(interval >= 0);
+    try std.testing.expect(interval.toNanoseconds() >= 0);
 }
 
 test "Limit.burstOffset: burst=maxInt(u32) with large interval does not panic" {
@@ -250,7 +268,7 @@ test "Limit.burstOffset: burst=maxInt(u32) with large interval does not panic" {
     // burst = 1 → offset = 1_000_000_000
     const l = Limit.perSecond(1);
     const offset = l.burstOffset(1);
-    try std.testing.expectEqual(std.time.ns_per_s, offset);
+    try std.testing.expectEqual(@as(i96, std.time.ns_per_s), offset.toNanoseconds());
 }
 
 test "Decision.isAllowed" {
@@ -376,22 +394,22 @@ test "ManualClock: starts at zero" {
 
 test "ManualClock: tick advances time" {
     var c = ManualClock{};
-    c.tick(1_000_000);
-    c.tick(500_000);
+    c.tick(.fromNanoseconds(1_000_000));
+    c.tick(.fromNanoseconds(500_000));
     try std.testing.expectEqual(@as(i64, 1_500_000), c.clock().now());
 }
 
 test "ManualClock: set jumps to absolute time" {
     var c = ManualClock{};
-    c.tick(9999);
-    c.set(1_000_000_000);
+    c.tick(.fromNanoseconds(9999));
+    c.set(.fromNanoseconds(1_000_000_000));
     try std.testing.expectEqual(@as(i64, 1_000_000_000), c.clock().now());
 }
 
 test "ManualClock: Clock interface forwards correctly" {
     var mc = ManualClock{};
     const clk = mc.clock();
-    mc.set(42_000);
+    mc.set(.fromNanoseconds(42_000));
     try std.testing.expectEqual(@as(i64, 42_000), clk.now());
 }
 
@@ -399,26 +417,39 @@ test "ManualClock: many ticks accumulate correctly" {
     var c = ManualClock{};
     var i: usize = 0;
     while (i < 1000) : (i += 1) {
-        c.tick(1_000_000); // 1ms each
+        c.tick(.fromNanoseconds(1_000_000)); // 1ms each
     }
     try std.testing.expectEqual(@as(i64, 1_000_000_000), c.clock().now());
 }
 
 test "ManualClock: set then tick combines correctly" {
     var c = ManualClock{};
-    c.set(5_000_000_000); // 5s
-    c.tick(2_000_000_000); // +2s
+    c.set(.fromNanoseconds(5_000_000_000)); // 5s
+    c.tick(.fromNanoseconds(2_000_000_000)); // +2s
     try std.testing.expectEqual(@as(i64, 7_000_000_000), c.clock().now());
 }
 
 test "ManualClock: tick saturates at maximum" {
     var c = ManualClock{ .time_ns = std.math.maxInt(i64) - 1 };
-    c.tick(2);
+    c.tick(.fromNanoseconds(2));
     try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), c.clock().now());
 }
 
 test "ManualClock: negative tick saturates at minimum" {
     var c = ManualClock{ .time_ns = std.math.minInt(i64) + 1 };
-    c.tick(-2);
+    c.tick(.fromNanoseconds(-2));
     try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), c.clock().now());
+}
+
+test "ManualClock: wider Duration and Timestamp values clamp safely" {
+    var c = ManualClock{};
+    c.set(.fromNanoseconds(std.math.maxInt(i96)));
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), c.clock().now());
+
+    c.set(.fromNanoseconds(std.math.minInt(i96)));
+    try std.testing.expectEqual(@as(i64, std.math.minInt(i64)), c.clock().now());
+
+    c.set(.zero);
+    c.tick(.max);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), c.clock().now());
 }
