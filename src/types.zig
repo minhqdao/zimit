@@ -56,9 +56,8 @@ pub const Limit = struct {
 
 /// The result of a rate-limit check.
 pub const Decision = union(enum) {
-    /// Request is allowed. `new_tat` is the updated Theoretical Arrival Time
-    /// the caller must persist back to the store.
-    allowed: struct { new_tat: i64 },
+    /// Request is allowed.
+    allowed,
 
     /// Request is denied. The caller decides whether to sleep, suspend a fiber,
     /// return a 429, or do something else with `retry_after`.
@@ -255,7 +254,7 @@ test "Limit.burstOffset: burst=maxInt(u32) with large interval does not panic" {
 }
 
 test "Decision.isAllowed" {
-    const allowed = Decision{ .allowed = .{ .new_tat = 42 } };
+    const allowed: Decision = .allowed;
     const denied = Decision{ .denied = .{
         .retry_after = .fromNanoseconds(1000),
     } };
@@ -264,7 +263,7 @@ test "Decision.isAllowed" {
 }
 
 test "Decision.retryAfter returns an Io Duration" {
-    const allowed = Decision{ .allowed = .{ .new_tat = 0 } };
+    const allowed: Decision = .allowed;
     const denied = Decision{ .denied = .{
         .retry_after = .fromNanoseconds(5_000_000),
     } };
@@ -303,7 +302,7 @@ test "Decision.retryAfterMillisecondsCeil rounds up safely" {
         );
     }
 
-    const allowed = Decision{ .allowed = .{ .new_tat = 0 } };
+    const allowed: Decision = .allowed;
     try std.testing.expectEqual(
         @as(?i64, null),
         allowed.retryAfterMillisecondsCeil(),

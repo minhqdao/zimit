@@ -69,6 +69,24 @@ fn defaultOwnership(comptime K: type) KeyOwnership(K) {
 
 // ── Pure GCRA engine ──────────────────────────────────────────────────────────
 
+const Admission = union(enum) {
+    allowed: struct { new_tat: i64 },
+    denied: struct { retry_after: std.Io.Duration },
+
+    fn decision(self: Admission) Decision {
+        return switch (self) {
+            .allowed => .allowed,
+            .denied => |denied| .{ .denied = .{
+                .retry_after = denied.retry_after,
+            } },
+        };
+    }
+
+    fn isAllowed(self: Admission) bool {
+        return self == .allowed;
+    }
+};
+
 /// Run one GCRA check. Pure function — no allocations, no side effects.
 ///
 /// Arguments:
@@ -79,15 +97,13 @@ fn defaultOwnership(comptime K: type) KeyOwnership(K) {
 ///   burst_offset_ns  How far into the past the TAT may lag (Limit.burstOffset()).
 ///
 /// Returns `error.TimeOverflow` when the resulting TAT or retry duration
-/// cannot be represented. Otherwise, on `.allowed`, persist
-/// `decision.new_tat` back to your store. On `.denied`, wait
-/// `decision.retry_after` before retrying.
-pub fn check(
+/// cannot be represented.
+fn check(
     tat: i64,
     now_ns: i64,
     emission_interval_ns: i64,
     burst_offset_ns: i64,
-) ZimitError!Decision {
+) ZimitError!Admission {
     return checkN(tat, now_ns, emission_interval_ns, burst_offset_ns, 1);
 }
 
@@ -102,7 +118,7 @@ fn checkN(
     emission_interval_ns: i64,
     burst_offset_ns: i64,
     n: u32,
-) ZimitError!Decision {
+) ZimitError!Admission {
     std.debug.assert(n > 0);
 
     // Wider intermediates preserve the exact admission calculation even when
@@ -167,7 +183,7 @@ const Engine = struct {
         if (!self.allowsBatch(n)) return error.BatchTooLarge;
     }
 
-    fn decide(self: Engine, tat: i64, now: i64, n: u32) ZimitError!Decision {
+    fn decide(self: Engine, tat: i64, now: i64, n: u32) ZimitError!Admission {
         if (n == 0) return .{ .allowed = .{ .new_tat = tat } };
         try self.validateBatch(n);
         return checkN(
@@ -320,7 +336,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
             if (n == 0) {
                 const tat = if (self.store.get(key)) |state| state.tat else 0;
-                return try self.engine.decide(tat, 0, n);
+                return (try self.engine.decide(tat, 0, n)).decision();
             }
             try self.engine.validateBatch(n);
 
@@ -329,22 +345,22 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             // Only lookup — never trust existing key memory
             if (self.store.getEntry(key)) |entry| {
                 entry.value_ptr.last_seen_ns = now;
-                const decision = try self.engine.decide(
+                const admission = try self.engine.decide(
                     entry.value_ptr.tat,
                     now,
                     n,
                 );
 
-                if (decision == .allowed) {
-                    entry.value_ptr.tat = decision.allowed.new_tat;
+                if (admission == .allowed) {
+                    entry.value_ptr.tat = admission.allowed.new_tat;
                 }
 
-                return decision;
+                return admission.decision();
             }
 
-            const decision = try self.engine.decide(0, now, n);
+            const admission = try self.engine.decide(0, now, n);
 
-            if (decision == .allowed) {
+            if (admission == .allowed) {
                 try self.maintainForNewKey(now);
 
                 const owned_key = try self.cloneKey(key);
@@ -352,16 +368,16 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
                 errdefer self.deinitKey(owned_key);
 
                 try self.store.put(owned_key, .{
-                    .tat = decision.allowed.new_tat,
+                    .tat = admission.allowed.new_tat,
                     .last_seen_ns = now,
                 });
                 self.schedulePrune(.{
-                    .tat = decision.allowed.new_tat,
+                    .tat = admission.allowed.new_tat,
                     .last_seen_ns = now,
                 });
             }
 
-            return decision;
+            return admission.decision();
         }
 
         pub fn validateBatch(self: *const Self, n: u32) ZimitError!void {
@@ -511,7 +527,11 @@ pub const AtomicLimiter = struct {
     /// are granted or none are — partial grants never occur.
     pub fn allowN(self: *AtomicLimiter, n: u32) ZimitError!Decision {
         if (n == 0) {
-            return try self.engine.decide(self.tat.load(.monotonic), 0, n);
+            return (try self.engine.decide(
+                self.tat.load(.monotonic),
+                0,
+                n,
+            )).decision();
         }
         try self.engine.validateBatch(n);
 
@@ -520,18 +540,18 @@ pub const AtomicLimiter = struct {
         while (true) {
             const old_tat = self.tat.load(.monotonic);
 
-            const decision = try self.engine.decide(old_tat, now, n);
+            const admission = try self.engine.decide(old_tat, now, n);
 
-            switch (decision) {
-                .denied => return decision,
-                .allowed => |a| {
+            switch (admission) {
+                .denied => return admission.decision(),
+                .allowed => |allowed| {
                     if (self.tat.cmpxchgWeak(
                         old_tat,
-                        a.new_tat,
+                        allowed.new_tat,
                         .acq_rel,
                         .monotonic,
                     ) == null) {
-                        return decision;
+                        return admission.decision();
                     }
                 },
             }
