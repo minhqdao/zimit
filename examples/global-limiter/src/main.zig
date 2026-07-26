@@ -4,12 +4,9 @@ const zimit = @import("zimit");
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
 
-    var sys = zimit.SystemClock.init(io);
-
-    var limiter = try zimit.GlobalLimiter.init(.{
+    var limiter = try zimit.GlobalLimiter.init(io, .{
         .limit = .perSecond(5),
         .burst = 2,
-        .clock = sys.clock(),
     });
 
     var i: usize = 0;
