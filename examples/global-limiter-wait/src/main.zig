@@ -7,8 +7,7 @@ pub fn main(init: std.process.Init) !void {
     var sys = zimit.SystemClock.init(io);
 
     var limiter = try zimit.GlobalLimiter.init(.{
-        .rate = 1,
-        .per = .second,
+        .limit = .perSecond(1),
         .burst = 2,
         .clock = sys.clock(),
     });

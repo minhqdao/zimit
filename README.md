@@ -29,8 +29,7 @@ pub fn main(init: std.process.Init) !void {
 
     var limiter = try zimit.RateLimiter([]const u8).init(.{
         .allocator = gpa,
-        .rate = 5,
-        .per = .second,
+        .limit = .perSecond(5),
         .burst = 2,
         .clock = sys.clock(),
     });
@@ -50,6 +49,11 @@ pub fn main(init: std.process.Init) !void {
 }
 
 ```
+
+Use `Limit.perSecond`, `Limit.perMinute`, or `Limit.perHour` for common rates.
+For an arbitrary period, initialize `Limit` directly with `count` and
+`period_ns`.
+
 See [examples](examples) for more.
 
 
