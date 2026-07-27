@@ -49,13 +49,6 @@ pub const ManualClock = types.ManualClock;
 pub const ZimitError = types.ZimitError;
 pub const KeyOwnership = gcra.KeyOwnership;
 
-pub fn KeyOptions(comptime K: type, comptime Context: type) type {
-    return struct {
-        context: Context,
-        ownership: KeyOwnership(K),
-    };
-}
-
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Configuration for `RateLimiter.init`.
@@ -188,18 +181,26 @@ pub const GlobalLimiter = struct {
 ///
 /// For a thread-safe global limiter that doesn't require keys, see `GlobalLimiter`.
 pub fn RateLimiter(comptime K: type) type {
-    return RateLimiterImpl(K, gcra.DefaultContext(K));
+    return RateLimiterImpl(K, gcra.DefaultContext(K), .default);
 }
 
 /// A keyed limiter using a caller-provided `std.HashMap` context.
 ///
-/// Initialise with `initWithKeyOptions` or `initWithClockAndKeyOptions` and
-/// explicitly select borrowed or owned key storage.
+/// Its nested `Config` requires an explicit context and key-ownership policy.
 pub fn RateLimiterWithContext(comptime K: type, comptime Context: type) type {
-    return RateLimiterImpl(K, Context);
+    return RateLimiterImpl(K, Context, .custom);
 }
 
-fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
+const KeyConfigKind = enum {
+    default,
+    custom,
+};
+
+fn RateLimiterImpl(
+    comptime K: type,
+    comptime Context: type,
+    comptime config_kind: KeyConfigKind,
+) type {
     return struct {
         const Self = @This();
         const Inner = gcra.LimiterWithContext(K, Context);
@@ -208,70 +209,59 @@ fn RateLimiterImpl(comptime K: type, comptime Context: type) type {
             key: K,
         };
 
+        /// Configuration accepted by this limiter's constructors.
+        pub const Config = switch (config_kind) {
+            .default => RateLimiterConfig,
+            .custom => struct {
+                allocator: std.mem.Allocator,
+                /// Rate to enforce.
+                limit: Limit,
+                /// Extra requests allowed in a burst on top of the base rate.
+                burst: u32 = 0,
+                /// Reserve space for this many keys during initialization.
+                initial_capacity: u32 = 0,
+                /// Maximum number of retained keys, or `null` for no bound.
+                max_entries: ?usize = null,
+                /// Remove fully-drained keys after this much inactivity.
+                idle_timeout: ?std.Io.Duration = null,
+                /// Hashing and equality behavior for keys.
+                context: Context,
+                /// Whether keys are borrowed from the caller or owned.
+                ownership: KeyOwnership(K),
+            },
+        };
+
         inner: Inner,
 
         /// Initialise a production limiter using Zig's monotonic awake clock.
-        pub fn init(io: std.Io, cfg: RateLimiterConfig) ZimitError!Self {
-            if (Context != gcra.DefaultContext(K)) {
-                @compileError("custom contexts must use initWithKeyOptions");
-            }
+        pub fn init(io: std.Io, cfg: Config) ZimitError!Self {
             return initWithClock(cfg, .{ .system = io });
         }
 
         /// Initialise with an explicit clock, typically for deterministic tests.
         /// The clock's backing object must outlive the limiter.
-        pub fn initWithClock(cfg: RateLimiterConfig, clock: Clock) ZimitError!Self {
-            if (Context != gcra.DefaultContext(K)) {
-                @compileError(
-                    "custom contexts must use initWithClockAndKeyOptions",
-                );
-            }
-            return .{
-                .inner = try Inner.initWithConfigAndStorage(
-                    cfg.allocator,
-                    engineConfig(cfg, clock),
-                    .{
-                        .initial_capacity = cfg.initial_capacity,
-                        .max_entries = cfg.max_entries,
-                        .idle_timeout = cfg.idle_timeout,
-                    },
-                ),
+        pub fn initWithClock(cfg: Config, clock: Clock) ZimitError!Self {
+            const storage: gcra.StorageOptions = .{
+                .initial_capacity = cfg.initial_capacity,
+                .max_entries = cfg.max_entries,
+                .idle_timeout = cfg.idle_timeout,
             };
-        }
 
-        /// Initialise a production limiter with explicit hashing and ownership.
-        pub fn initWithKeyOptions(
-            io: std.Io,
-            cfg: RateLimiterConfig,
-            key_options: KeyOptions(K, Context),
-        ) ZimitError!Self {
-            return initWithClockAndKeyOptions(
-                cfg,
-                .{ .system = io },
-                key_options,
-            );
-        }
-
-        /// Initialise with explicit clock, hashing, and ownership.
-        /// Borrowed key memory must stay alive and hash-equivalent while stored;
-        /// the clock backing object must outlive the limiter.
-        pub fn initWithClockAndKeyOptions(
-            cfg: RateLimiterConfig,
-            clock: Clock,
-            key_options: KeyOptions(K, Context),
-        ) ZimitError!Self {
             return .{
-                .inner = try Inner.initWithKeyOptions(
-                    cfg.allocator,
-                    engineConfig(cfg, clock),
-                    .{
-                        .initial_capacity = cfg.initial_capacity,
-                        .max_entries = cfg.max_entries,
-                        .idle_timeout = cfg.idle_timeout,
-                    },
-                    key_options.context,
-                    key_options.ownership,
-                ),
+                .inner = switch (config_kind) {
+                    .default => try Inner.initWithConfigAndStorage(
+                        cfg.allocator,
+                        engineConfig(cfg, clock),
+                        storage,
+                    ),
+                    .custom => try Inner.initWithKeyOptions(
+                        cfg.allocator,
+                        engineConfig(cfg, clock),
+                        storage,
+                        cfg.context,
+                        cfg.ownership,
+                    ),
+                },
             };
         }
 
@@ -429,17 +419,12 @@ test "production constructors remain valid after return by value" {
 test "RateLimiterWithContext supports borrowed keys and custom equality" {
     var mc = ManualClock{};
     const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
-    var limiter = try CustomLimiter.initWithClockAndKeyOptions(
-        .{
-            .allocator = std.testing.allocator,
-            .limit = .perSecond(1),
-        },
-        mc.clock(),
-        .{
-            .context = .{ .seed = 42 },
-            .ownership = .borrowed,
-        },
-    );
+    var limiter = try CustomLimiter.initWithClock(.{
+        .allocator = std.testing.allocator,
+        .limit = .perSecond(1),
+        .context = .{ .seed = 42 },
+        .ownership = .borrowed,
+    }, mc.clock());
     defer limiter.deinit();
 
     try std.testing.expect((try limiter.allow(.{
@@ -455,23 +440,49 @@ test "RateLimiterWithContext supports borrowed keys and custom equality" {
     try std.testing.expectEqual(@as(usize, 0), limiter.keyCount());
 }
 
+test "RateLimiterWithContext production constructor uses custom Config" {
+    const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
+    var limiter = try CustomLimiter.init(std.testing.io, .{
+        .allocator = std.testing.allocator,
+        .limit = .perSecond(1),
+        .context = .{ .seed = 42 },
+        .ownership = .borrowed,
+    });
+    defer limiter.deinit();
+
+    try std.testing.expect((try limiter.allow(.{
+        .tenant = 7,
+        .name = "Alice",
+    })).isAllowed());
+}
+
+test "custom and default limiter types expose only their valid configuration" {
+    const DefaultLimiter = RateLimiter(TestKey);
+    const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
+
+    try std.testing.expect(!@hasField(DefaultLimiter.Config, "context"));
+    try std.testing.expect(!@hasField(DefaultLimiter.Config, "ownership"));
+    try std.testing.expect(@hasField(CustomLimiter.Config, "context"));
+    try std.testing.expect(@hasField(CustomLimiter.Config, "ownership"));
+    try std.testing.expect(!@hasDecl(CustomLimiter, "initWithKeyOptions"));
+    try std.testing.expect(!@hasDecl(
+        CustomLimiter,
+        "initWithClockAndKeyOptions",
+    ));
+}
+
 test "RateLimiterWithContext can own deeply copied keys" {
     var mc = ManualClock{};
     const CustomLimiter = RateLimiterWithContext(TestKey, TestKeyContext);
-    var limiter = try CustomLimiter.initWithClockAndKeyOptions(
-        .{
-            .allocator = std.testing.allocator,
-            .limit = .perSecond(1),
-        },
-        mc.clock(),
-        .{
-            .context = .{ .seed = 42 },
-            .ownership = .{ .owned = .{
-                .clone = cloneTestKey,
-                .deinit = deinitTestKey,
-            } },
-        },
-    );
+    var limiter = try CustomLimiter.initWithClock(.{
+        .allocator = std.testing.allocator,
+        .limit = .perSecond(1),
+        .context = .{ .seed = 42 },
+        .ownership = .{ .owned = .{
+            .clone = cloneTestKey,
+            .deinit = deinitTestKey,
+        } },
+    }, mc.clock());
     defer limiter.deinit();
 
     var original: ?[]u8 = try std.testing.allocator.dupe(u8, "Alice");

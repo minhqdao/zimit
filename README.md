@@ -62,7 +62,9 @@ See [examples](examples) for more.
 
 String keys are copied automatically, and integer keys work directly.
 Applications using structured keys with custom equality or memory ownership can
-use `RateLimiterWithContext`.
+use `RateLimiterWithContext`. Its `Config` adds the required `context` and
+`ownership` fields while retaining the usual `init` and `initWithClock`
+constructors.
 
 
 ## Installation
