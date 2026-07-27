@@ -26,30 +26,13 @@ pub fn build(b: *std.Build) void {
 
     // ── Tests ─────────────────────────────────────────────────────────────────
     //
-    // `zig build test` runs all tests across every source file.
-    // We add each file explicitly so new files are never silently skipped.
+    // Tests imported by root.zig are discovered transitively by Zig.
     const test_step = b.step("test", "Run all zimit tests");
-
-    const test_files = [_][]const u8{
-        "src/types.zig",
-        "src/gcra.zig",
-        "src/root.zig",
-    };
-
-    for (test_files) |file| {
-        const t = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(file),
-                .target = target,
-                .optimize = optimize,
-            }),
-        });
-        t.root_module.addImport("zimit", zimit_mod);
-
-        const run_t = b.addRunArtifact(t);
-        run_t.has_side_effects = true; // always re-run, never cache
-        test_step.dependOn(&run_t.step);
-    }
+    const tests = b.addTest(.{
+        .root_module = zimit_mod,
+    });
+    const run_tests = b.addRunArtifact(tests);
+    test_step.dependOn(&run_tests.step);
 
     // ── Examples ─────────────────────────────────────────────────────────────
     //
