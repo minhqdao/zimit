@@ -95,7 +95,9 @@ pub const Decision = union(enum) {
 /// A time source used by the limiter.
 ///
 /// The system variant owns a copy of `std.Io`, so it remains valid when the
-/// limiter is moved. Custom clocks borrow their backing object.
+/// limiter is moved. Custom clocks borrow their backing object, which must
+/// outlive the clock. When used by a shared `GlobalLimiter`, a custom clock's
+/// `now_fn` must support concurrent calls.
 pub const Clock = union(enum) {
     system: std.Io,
     custom: struct {
@@ -145,6 +147,9 @@ pub const SystemClock = struct {
 /// A manually-advanced clock for deterministic tests.
 /// Call `.tick(duration)` to advance time; call `.set(timestamp)` to jump to
 /// an absolute time.
+///
+/// This type is not thread-safe. Do not inject it into a `GlobalLimiter` that
+/// is accessed concurrently.
 pub const ManualClock = struct {
     time_ns: i64 = 0,
 

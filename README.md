@@ -4,7 +4,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 
 ## Features
 
-- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). It's lock-free and thread-safe.
+- **Global limiting:** Use `GlobalLimiter` when you want a single shared limit across all requests (e.g. protect total server throughput). Its state is lock-free and thread-safe; clocks injected with `initWithClock` must also be thread-safe.
 - **Per-key rate limiting:** Each key is tracked independently (e.g. per user ID or IP address). The `RateLimiter` is **not** thread-safe. If you share it across multiple threads, you should protect it with a `std.Io.Mutex`.
 - **Key storage controls:** Use `initial_capacity` to reserve space up front, and configure `max_entries` with an `idle_timeout` duration to bound memory and reclaim inactive, fully-drained keys. Explicit `pruneExpired()` calls return an allocation error if pruning scratch space cannot be reserved.
 - **Blocking vs non-blocking:**
@@ -15,7 +15,7 @@ A zero-dependency GCRA-based rate limiter with a token-bucket-like API for Zig 0
 - **Clocks:**
   - `init(io, config)` → Installs Zig's monotonic `.awake` clock automatically
   - `initWithClock(config, clock)` → Injects a custom clock for deterministic tests
-  - `ManualClock` → Built-in manually controlled testing clock
+  - `ManualClock` → Built-in single-threaded testing clock
 
 ## Usage
 

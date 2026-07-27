@@ -111,8 +111,10 @@ fn waitForN(
 /// For per-key limits use `RateLimiter(K)`.
 ///
 /// ### Thread Safety
-/// This type is **thread-safe**. It can be used across multiple threads without
-/// additional synchronization.
+/// The limiter state is lock-free and thread-safe. `init` installs the
+/// thread-safe system clock, so the resulting limiter can be shared without
+/// additional synchronization. A clock passed to `initWithClock` must itself
+/// support concurrent calls to `Clock.now`.
 pub const GlobalLimiter = struct {
     inner: gcra.AtomicLimiter,
 
@@ -122,7 +124,8 @@ pub const GlobalLimiter = struct {
     }
 
     /// Initialise with an explicit clock, typically for deterministic tests.
-    /// The clock's backing object must outlive the limiter.
+    /// The clock's backing object must outlive the limiter. If the limiter is
+    /// shared across threads, the custom clock must also be thread-safe.
     pub fn initWithClock(
         cfg: GlobalLimiterConfig,
         clock: Clock,
@@ -160,6 +163,9 @@ pub const GlobalLimiter = struct {
     }
 
     /// Resets the limiter to its initial state.
+    ///
+    /// This may race with `allow`, `allowN`, `wait`, and `waitN`. Each
+    /// admission is applied atomically either before or after the reset.
     pub fn reset(self: *GlobalLimiter) void {
         self.inner.reset();
     }
