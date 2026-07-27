@@ -496,8 +496,10 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
 /// token bucket.
 ///
 /// ### Thread Safety
-/// This type is **thread-safe**. Threads never block each other;
-/// a thread that loses a CAS race retries immediately with the freshly-loaded TAT.
+/// The limiter state is thread-safe and lock-free. Its clock must also support
+/// concurrent calls to `Clock.now`; otherwise the complete limiter is not
+/// thread-safe. A thread that loses a CAS race retries immediately with the
+/// freshly-loaded TAT.
 pub const AtomicLimiter = struct {
     tat: std.atomic.Value(i64),
     engine: Engine,
@@ -569,8 +571,10 @@ pub const AtomicLimiter = struct {
         return self.engine.validateBatch(n);
     }
 
-    /// Reset the limiter to its initial state — useful in tests.
-    /// Not safe to call concurrently with `allow`.
+    /// Reset the limiter to its initial state.
+    ///
+    /// May race with `allow` and `allowN`. Atomic modification order makes
+    /// each admission take effect either before or after the reset.
     pub fn reset(self: *AtomicLimiter) void {
         self.tat.store(0, .release);
     }
