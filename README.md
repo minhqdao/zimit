@@ -139,5 +139,15 @@ Run the test suite with:
 zig build test
 ```
 
+## Benchmarks
+
+Run the ReleaseFast benchmark suite with `zig build bench`. It measures global
+admission, contended global admission, keyed hits, borrowed and copied new-key
+insertion, full-capacity rejection, and pruning. Workload sizes are configurable:
+
+```shell
+zig build bench -Dbench-iterations=2000000 -Dbench-keys=50000 -Dbench-threads=8
+```
+
 ## License
 [MIT](LICENSE)

@@ -78,10 +78,47 @@ pub fn build(b: *std.Build) void {
     const docs_step = b.step("docs", "Emit HTML documentation to zig-out/docs/");
     docs_step.dependOn(&docs.step);
 
-    // ── Benchmark stub ────────────────────────────────────────────────────────
-    //
-    // `zig build bench` — placeholder for a future bench/main.zig.
-    // Add it now so CI can run it without changing build.zig later.
-    const bench_step = b.step("bench", "Run benchmarks (see bench/main.zig)");
-    _ = bench_step; // remove the _ when bench/main.zig exists
+    // ── Benchmarks ────────────────────────────────────────────────────────────
+    const bench_iterations = b.option(
+        usize,
+        "bench-iterations",
+        "Operations per admission benchmark",
+    ) orelse 1_000_000;
+    const bench_keys = b.option(
+        usize,
+        "bench-keys",
+        "Keys used by storage and pruning benchmarks",
+    ) orelse 20_000;
+    const bench_threads_requested = b.option(
+        usize,
+        "bench-threads",
+        "Threads used by the contention benchmark (1-64)",
+    ) orelse 4;
+    const bench_threads = std.math.clamp(bench_threads_requested, 1, 64);
+
+    const bench_options = b.addOptions();
+    bench_options.addOption(usize, "iterations", @max(bench_iterations, 1));
+    bench_options.addOption(usize, "keys", @max(bench_keys, 1));
+    bench_options.addOption(usize, "threads", bench_threads);
+
+    const bench_zimit_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const bench_exe = b.addExecutable(.{
+        .name = "zimit-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "zimit", .module = bench_zimit_mod },
+                .{ .name = "bench_options", .module = bench_options.createModule() },
+            },
+        }),
+    });
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run limiter benchmarks (ReleaseFast)");
+    bench_step.dependOn(&run_bench.step);
 }
