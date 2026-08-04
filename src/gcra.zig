@@ -9,7 +9,8 @@ const types = @import("types.zig");
 pub const Limit = types.Limit;
 pub const Decision = types.Decision;
 pub const Clock = types.Clock;
-pub const ZimitError = types.ZimitError;
+pub const InitializationError = types.InitializationError;
+pub const AdmissionError = types.AdmissionError;
 
 pub const Config = struct {
     limit: Limit,
@@ -103,7 +104,7 @@ fn check(
     now_ns: i64,
     emission_interval_ns: i64,
     burst_offset_ns: i64,
-) ZimitError!Admission {
+) error{TimeOverflow}!Admission {
     return checkN(tat, now_ns, emission_interval_ns, burst_offset_ns, 1);
 }
 
@@ -118,7 +119,7 @@ fn checkN(
     emission_interval_ns: i64,
     burst_offset_ns: i64,
     n: u32,
-) ZimitError!Admission {
+) error{TimeOverflow}!Admission {
     std.debug.assert(n > 0);
 
     // Wider intermediates preserve the exact admission calculation even when
@@ -163,7 +164,7 @@ const Engine = struct {
     max_batch: u64,
     burst_capacity: u64,
 
-    fn init(config: Config) ZimitError!Engine {
+    fn init(config: Config) InitializationError!Engine {
         const parameters = try deriveParameters(config.limit, config.burst);
         return .{
             .emission_interval_ns = parameters.interval,
@@ -179,11 +180,11 @@ const Engine = struct {
             @as(u64, n) <= self.burst_capacity;
     }
 
-    fn validateBatch(self: Engine, n: u32) ZimitError!void {
+    fn validateBatch(self: Engine, n: u32) error{BatchTooLarge}!void {
         if (!self.allowsBatch(n)) return error.BatchTooLarge;
     }
 
-    fn decide(self: Engine, tat: i64, now: i64, n: u32) ZimitError!Admission {
+    fn decide(self: Engine, tat: i64, now: i64, n: u32) error{ BatchTooLarge, TimeOverflow }!Admission {
         if (n == 0) return .{ .allowed = .{ .new_tat = tat } };
         try self.validateBatch(n);
         return checkN(
@@ -196,13 +197,13 @@ const Engine = struct {
     }
 };
 
-fn deriveParameters(limit: Limit, burst: u32) ZimitError!Parameters {
+fn deriveParameters(limit: Limit, burst: u32) InitializationError!Parameters {
     const period_ns_wide = limit.period.toNanoseconds();
     if (limit.count == 0 or period_ns_wide <= 0) return error.InvalidLimit;
     if (period_ns_wide > std.math.maxInt(i64)) return error.TimeOverflow;
 
     const period_ns: i64 = @intCast(period_ns_wide);
-    if (limit.count > period_ns) return error.RateExceedsRes;
+    if (limit.count > period_ns) return error.RateExceedsClockResolution;
 
     const interval = @divTrunc(period_ns, @as(i64, limit.count));
     const burst_product = @mulWithOverflow(interval, @as(i64, burst));
@@ -254,7 +255,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             limit: Limit,
             burst: u32,
             clock: Clock,
-        ) ZimitError!Self {
+        ) InitializationError!Self {
             return initWithConfig(allocator, .{
                 .limit = limit,
                 .burst = burst,
@@ -265,7 +266,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         pub fn initWithConfig(
             allocator: std.mem.Allocator,
             config: Config,
-        ) ZimitError!Self {
+        ) InitializationError!Self {
             return initWithConfigAndStorage(allocator, config, .{});
         }
 
@@ -273,7 +274,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             allocator: std.mem.Allocator,
             config: Config,
             storage: StorageOptions,
-        ) ZimitError!Self {
+        ) InitializationError!Self {
             if (Context != DefaultContext(K)) {
                 @compileError("custom contexts must use initWithKeyOptions");
             }
@@ -292,7 +293,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             storage: StorageOptions,
             context: Context,
             key_ownership: KeyOwnership(K),
-        ) ZimitError!Self {
+        ) InitializationError!Self {
             const idle_timeout_ns = if (storage.idle_timeout) |timeout| timeout_ns: {
                 const ns = timeout.toNanoseconds();
                 if (ns <= 0) return error.InvalidIdleTimeout;
@@ -332,7 +333,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         }
 
         /// Convenience for `checkKeyN(key, 1)`.
-        pub fn checkKey(self: *Self, key: K) ZimitError!Decision {
+        pub fn checkKey(self: *Self, key: K) AdmissionError!Decision {
             return self.checkKeyN(key, 1);
         }
 
@@ -340,7 +341,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
         ///
         /// If K is `[]const u8`, the key is duplicated and owned by the limiter
         /// if it's the first time we see it.
-        pub fn checkKeyN(self: *Self, key: K, n: u32) ZimitError!Decision {
+        pub fn checkKeyN(self: *Self, key: K, n: u32) AdmissionError!Decision {
             if (n == 0) {
                 const tat = if (self.store.get(key)) |state| state.tat else 0;
                 return (try self.engine.decide(tat, 0, n)).decision();
@@ -387,7 +388,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             return admission.decision();
         }
 
-        pub fn validateBatch(self: *const Self, n: u32) ZimitError!void {
+        pub fn validateBatch(self: *const Self, n: u32) error{BatchTooLarge}!void {
             return self.engine.validateBatch(n);
         }
 
@@ -405,11 +406,11 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
 
         /// Remove entries that are idle and have no outstanding rate-limit debt.
         /// Returns the number of entries removed.
-        pub fn pruneExpired(self: *Self) ZimitError!usize {
+        pub fn pruneExpired(self: *Self) std.mem.Allocator.Error!usize {
             return try self.pruneExpiredAt(self.engine.clock.now());
         }
 
-        fn maintainForNewKey(self: *Self, now: i64) ZimitError!void {
+        fn maintainForNewKey(self: *Self, now: i64) error{ OutOfMemory, CapacityExceeded }!void {
             if (now >= self.next_prune_ns) {
                 _ = try self.pruneExpiredAt(now);
             }
@@ -418,7 +419,7 @@ pub fn LimiterWithContext(comptime K: type, comptime Context: type) type {
             if (self.store.count() >= maximum) return error.CapacityExceeded;
         }
 
-        fn pruneExpiredAt(self: *Self, now: i64) ZimitError!usize {
+        fn pruneExpiredAt(self: *Self, now: i64) std.mem.Allocator.Error!usize {
             const timeout = self.idle_timeout_ns orelse return 0;
             self.expired_keys.clearRetainingCapacity();
 
@@ -510,7 +511,7 @@ pub const AtomicLimiter = struct {
         limit: Limit,
         burst: u32,
         clock: Clock,
-    ) ZimitError!AtomicLimiter {
+    ) InitializationError!AtomicLimiter {
         return initWithConfig(.{
             .limit = limit,
             .burst = burst,
@@ -519,7 +520,7 @@ pub const AtomicLimiter = struct {
     }
 
     /// Initialise from shared limiter configuration.
-    pub fn initWithConfig(config: Config) ZimitError!AtomicLimiter {
+    pub fn initWithConfig(config: Config) InitializationError!AtomicLimiter {
         return .{
             .tat = std.atomic.Value(i64).init(0),
             .engine = try Engine.init(config),
@@ -528,13 +529,13 @@ pub const AtomicLimiter = struct {
 
     /// Check whether a single request is allowed right now.
     /// Safe to call from any number of threads simultaneously.
-    pub fn allow(self: *AtomicLimiter) ZimitError!Decision {
+    pub fn allow(self: *AtomicLimiter) AdmissionError!Decision {
         return self.allowN(1);
     }
 
     /// Atomically consume `n` slots. All-or-nothing: either all `n` slots
     /// are granted or none are — partial grants never occur.
-    pub fn allowN(self: *AtomicLimiter, n: u32) ZimitError!Decision {
+    pub fn allowN(self: *AtomicLimiter, n: u32) AdmissionError!Decision {
         if (n == 0) {
             return (try self.engine.decide(
                 self.tat.load(.monotonic),
@@ -567,7 +568,7 @@ pub const AtomicLimiter = struct {
         }
     }
 
-    pub fn validateBatch(self: *const AtomicLimiter, n: u32) ZimitError!void {
+    pub fn validateBatch(self: *const AtomicLimiter, n: u32) error{BatchTooLarge}!void {
         return self.engine.validateBatch(n);
     }
 
@@ -863,7 +864,7 @@ test "Limiter: init rejects rate > 1 req/ns" {
     var mc = types.ManualClock{};
     const bad = Limit{ .count = 2, .period = .fromNanoseconds(1) };
     const result = StringLimiter.init(std.testing.allocator, bad, 0, mc.clock());
-    try std.testing.expectError(error.RateExceedsRes, result);
+    try std.testing.expectError(error.RateExceedsClockResolution, result);
 }
 
 test "Limiter: init rejects non-positive period" {
@@ -1580,7 +1581,7 @@ test "AtomicLimiter: init rejects rate > 1 req/ns" {
     var mc = types.ManualClock{};
     const bad = Limit{ .count = 2, .period = .fromNanoseconds(1) };
     try std.testing.expectError(
-        error.RateExceedsRes,
+        error.RateExceedsClockResolution,
         AtomicLimiter.init(bad, 0, mc.clock()),
     );
 }

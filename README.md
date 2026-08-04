@@ -66,6 +66,19 @@ use `RateLimiterWithContext`. Its `Config` adds the required `context` and
 `ownership` fields while retaining the usual `init` and `initWithClock`
 constructors.
 
+## Errors
+
+Zimit exposes operation-specific error sets so callers can handle failures
+exhaustively:
+
+- `InitializationError` covers invalid configuration, unrepresentable time
+  values, and initial keyed-storage allocation.
+- `AdmissionError` covers invalid batches, time overflow, keyed-storage
+  allocation, and configured key-capacity exhaustion.
+- `WaitError` contains every admission error plus `error.Canceled`, which is
+  returned when cancellation interrupts the underlying I/O sleep.
+
+`pruneExpired` is narrower still and returns only allocator errors.
 
 ## Installation
 

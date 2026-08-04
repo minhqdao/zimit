@@ -46,7 +46,9 @@ pub const Decision = types.Decision;
 pub const Clock = types.Clock;
 pub const SystemClock = types.SystemClock;
 pub const ManualClock = types.ManualClock;
-pub const ZimitError = types.ZimitError;
+pub const InitializationError = types.InitializationError;
+pub const AdmissionError = types.AdmissionError;
+pub const WaitError = types.WaitError;
 pub const KeyOwnership = gcra.KeyOwnership;
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -92,7 +94,7 @@ fn waitForN(
     n: u32,
     context: anytype,
     comptime allowNFn: anytype,
-) !void {
+) WaitError!void {
     while (true) {
         switch (try allowNFn(context, n)) {
             .allowed => return,
@@ -119,7 +121,7 @@ pub const GlobalLimiter = struct {
     inner: gcra.AtomicLimiter,
 
     /// Initialise a production limiter using Zig's monotonic awake clock.
-    pub fn init(io: std.Io, cfg: GlobalLimiterConfig) ZimitError!GlobalLimiter {
+    pub fn init(io: std.Io, cfg: GlobalLimiterConfig) InitializationError!GlobalLimiter {
         return initWithClock(cfg, .{ .system = io });
     }
 
@@ -129,36 +131,36 @@ pub const GlobalLimiter = struct {
     pub fn initWithClock(
         cfg: GlobalLimiterConfig,
         clock: Clock,
-    ) ZimitError!GlobalLimiter {
+    ) InitializationError!GlobalLimiter {
         return .{ .inner = try gcra.AtomicLimiter.initWithConfig(
             engineConfig(cfg, clock),
         ) };
     }
 
     /// Convenience for `allowN(1)`.
-    pub fn allow(self: *GlobalLimiter) ZimitError!Decision {
+    pub fn allow(self: *GlobalLimiter) AdmissionError!Decision {
         return self.allowN(1);
     }
 
     /// Atomically consume `n` slots.
     /// Returns `error.BatchTooLarge` when `n` exceeds `1 + burst`, and
     /// `error.TimeOverflow` when the resulting time cannot be represented.
-    pub fn allowN(self: *GlobalLimiter, n: u32) ZimitError!Decision {
+    pub fn allowN(self: *GlobalLimiter, n: u32) AdmissionError!Decision {
         return self.inner.allowN(n);
     }
 
     /// Block the calling thread until allowed.
-    pub fn wait(self: *GlobalLimiter, io: std.Io) !void {
+    pub fn wait(self: *GlobalLimiter, io: std.Io) WaitError!void {
         return self.waitN(io, 1);
     }
 
     /// Block until an atomic batch of `n` requests is allowed.
-    pub fn waitN(self: *GlobalLimiter, io: std.Io, n: u32) !void {
+    pub fn waitN(self: *GlobalLimiter, io: std.Io, n: u32) WaitError!void {
         try self.inner.validateBatch(n);
         return waitForN(io, n, self, attemptN);
     }
 
-    fn attemptN(self: *GlobalLimiter, n: u32) ZimitError!Decision {
+    fn attemptN(self: *GlobalLimiter, n: u32) AdmissionError!Decision {
         return self.allowN(n);
     }
 
@@ -240,13 +242,13 @@ fn RateLimiterImpl(
         inner: Inner,
 
         /// Initialise a production limiter using Zig's monotonic awake clock.
-        pub fn init(io: std.Io, cfg: Config) ZimitError!Self {
+        pub fn init(io: std.Io, cfg: Config) InitializationError!Self {
             return initWithClock(cfg, .{ .system = io });
         }
 
         /// Initialise with an explicit clock, typically for deterministic tests.
         /// The clock's backing object must outlive the limiter.
-        pub fn initWithClock(cfg: Config, clock: Clock) ZimitError!Self {
+        pub fn initWithClock(cfg: Config, clock: Clock) InitializationError!Self {
             const storage: gcra.StorageOptions = .{
                 .initial_capacity = cfg.initial_capacity,
                 .max_entries = cfg.max_entries,
@@ -281,7 +283,7 @@ fn RateLimiterImpl(
         /// On `.allowed` the internal state is updated immediately.
         /// On `.denied` the rate state is unchanged, but the key's last-seen
         /// time is refreshed when idle expiration is configured.
-        pub fn allow(self: *Self, key: K) ZimitError!Decision {
+        pub fn allow(self: *Self, key: K) AdmissionError!Decision {
             return self.allowN(key, 1);
         }
 
@@ -292,7 +294,7 @@ fn RateLimiterImpl(
         /// requests; larger batches return `error.BatchTooLarge`. Returns
         /// `error.TimeOverflow` when the resulting time cannot be represented.
         /// Useful for batch jobs or chunked uploads.
-        pub fn allowN(self: *Self, key: K, n: u32) ZimitError!Decision {
+        pub fn allowN(self: *Self, key: K, n: u32) AdmissionError!Decision {
             return self.inner.checkKeyN(key, n);
         }
 
@@ -300,12 +302,12 @@ fn RateLimiterImpl(
         ///
         /// This is the simple synchronous wait. For async contexts, use
         /// `allow` and handle the retry duration yourself.
-        pub fn wait(self: *Self, io: std.Io, key: K) !void {
+        pub fn wait(self: *Self, io: std.Io, key: K) WaitError!void {
             return self.waitN(io, key, 1);
         }
 
         /// Block until an atomic batch of `n` requests is allowed for `key`.
-        pub fn waitN(self: *Self, io: std.Io, key: K, n: u32) !void {
+        pub fn waitN(self: *Self, io: std.Io, key: K, n: u32) WaitError!void {
             try self.inner.validateBatch(n);
             return waitForN(io, n, WaitContext{
                 .limiter = self,
@@ -313,7 +315,7 @@ fn RateLimiterImpl(
             }, attemptN);
         }
 
-        fn attemptN(context: WaitContext, n: u32) ZimitError!Decision {
+        fn attemptN(context: WaitContext, n: u32) AdmissionError!Decision {
             return context.limiter.allowN(context.key, n);
         }
 
@@ -330,7 +332,7 @@ fn RateLimiterImpl(
 
         /// Remove fully-drained keys whose idle timeout has elapsed.
         /// Returns the number of keys removed.
-        pub fn pruneExpired(self: *Self) ZimitError!usize {
+        pub fn pruneExpired(self: *Self) std.mem.Allocator.Error!usize {
             return try self.inner.pruneExpired();
         }
     };
@@ -398,6 +400,30 @@ const TestKeyContext = struct {
             std.ascii.eqlIgnoreCase(a.name, b.name);
     }
 };
+
+test "public operations expose precise error sets" {
+    const Keyed = RateLimiter(u32);
+
+    comptime {
+        if (@typeInfo(@TypeOf(GlobalLimiter.init)).@"fn".return_type.? != InitializationError!GlobalLimiter)
+            @compileError("GlobalLimiter.init must return InitializationError");
+        if (@typeInfo(@TypeOf(GlobalLimiter.allow)).@"fn".return_type.? != AdmissionError!Decision)
+            @compileError("GlobalLimiter.allow must return AdmissionError");
+        if (@typeInfo(@TypeOf(GlobalLimiter.wait)).@"fn".return_type.? != WaitError!void)
+            @compileError("GlobalLimiter.wait must return WaitError");
+        if (@typeInfo(@TypeOf(Keyed.init)).@"fn".return_type.? != InitializationError!Keyed)
+            @compileError("RateLimiter.init must return InitializationError");
+        if (@typeInfo(@TypeOf(Keyed.allow)).@"fn".return_type.? != AdmissionError!Decision)
+            @compileError("RateLimiter.allow must return AdmissionError");
+        if (@typeInfo(@TypeOf(Keyed.wait)).@"fn".return_type.? != WaitError!void)
+            @compileError("RateLimiter.wait must return WaitError");
+        if (@typeInfo(@TypeOf(Keyed.pruneExpired)).@"fn".return_type.? != std.mem.Allocator.Error!usize)
+            @compileError("pruneExpired must return only allocator errors");
+    }
+
+    const canceled: WaitError = error.Canceled;
+    try std.testing.expectEqual(error.Canceled, canceled);
+}
 
 fn cloneTestKey(
     allocator: std.mem.Allocator,
@@ -1201,7 +1227,7 @@ test "RateLimiter: init rejects rate > 1 req/ns" {
         .limit = .perSecond(2_000_000_000),
         .burst = 0,
     }, mc.clock());
-    try std.testing.expectError(error.RateExceedsRes, result);
+    try std.testing.expectError(error.RateExceedsClockResolution, result);
 }
 
 test "RateLimiter: per-hour config with burst and time advance" {

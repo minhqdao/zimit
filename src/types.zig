@@ -187,22 +187,36 @@ pub const ManualClock = struct {
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
-pub const ZimitError = error{
+/// Errors reported while constructing a limiter.
+pub const InitializationError = error{
     /// count or period is zero — would produce a zero emission interval.
     InvalidLimit,
     /// count exceeds the period's nanoseconds — rate is > 1 req/ns.
-    RateExceedsRes,
-    /// Out of memory when inserting a new key into the store.
+    RateExceedsClockResolution,
+    /// Initial keyed storage could not be allocated.
     OutOfMemory,
-    /// Derived time values cannot be represented in nanoseconds.
+    /// A configured duration cannot be represented in nanoseconds.
+    TimeOverflow,
+    /// The configured idle timeout is not positive.
+    InvalidIdleTimeout,
+};
+
+/// Errors reported while attempting to admit one or more requests.
+pub const AdmissionError = error{
+    /// Storage for a new key or pruning bookkeeping could not be allocated.
+    OutOfMemory,
+    /// The resulting time cannot be represented in nanoseconds.
     TimeOverflow,
     /// The keyed limiter has reached its configured entry limit.
     CapacityExceeded,
-    /// The configured idle timeout is not positive.
-    InvalidIdleTimeout,
     /// A batch exceeds configured capacity or the representable time range.
     BatchTooLarge,
 };
+
+/// Errors reported while waiting for admission.
+///
+/// `Canceled` is returned when cancellation interrupts the underlying sleep.
+pub const WaitError = AdmissionError || std.Io.Cancelable;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
