@@ -47,5 +47,14 @@ jobs:
               with:
                   version: ${{ matrix.zig-version }}
             - run: zig build test --summary all
-            - run: zig build examples
+            - run: zig build examples --summary all
+            - name: Build global limiter example standalone
+              working-directory: examples/global-limiter
+              run: zig build --summary all
+            - name: Build waiting global limiter example standalone
+              working-directory: examples/global-limiter-wait
+              run: zig build --summary all
+            - name: Build rate limiter example standalone
+              working-directory: examples/rate-limiter
+              run: zig build --summary all
             - run: zig build docs # just verifying they build
