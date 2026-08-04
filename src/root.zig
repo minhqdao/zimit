@@ -44,7 +44,6 @@ const types = @import("types.zig");
 pub const Limit = types.Limit;
 pub const Decision = types.Decision;
 pub const Clock = types.Clock;
-pub const SystemClock = types.SystemClock;
 pub const ManualClock = types.ManualClock;
 pub const InitializationError = types.InitializationError;
 pub const AdmissionError = types.AdmissionError;
@@ -423,6 +422,12 @@ test "public operations expose precise error sets" {
 
     const canceled: WaitError = error.Canceled;
     try std.testing.expectEqual(error.Canceled, canceled);
+}
+
+test "engine implementation details are not public API" {
+    try std.testing.expect(!@hasDecl(@This(), "SystemClock"));
+    try std.testing.expect(!@hasDecl(Limit, "emissionInterval"));
+    try std.testing.expect(!@hasDecl(Limit, "burstOffset"));
 }
 
 fn cloneTestKey(

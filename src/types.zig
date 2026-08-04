@@ -21,7 +21,7 @@ pub const Limit = struct {
     /// Derived duration between each emission (period / count).
     /// This is the fundamental GCRA unit — one "slot" of time.
     /// Returns `.zero` when `count` is 0; initialization rejects that limit.
-    pub fn emissionInterval(self: Limit) std.Io.Duration {
+    fn emissionInterval(self: Limit) std.Io.Duration {
         if (self.count == 0) return .zero;
         return .fromNanoseconds(
             @divTrunc(self.period.toNanoseconds(), @as(i96, self.count)),
@@ -32,7 +32,7 @@ pub const Limit = struct {
     /// In GCRA terms: how far in the past the TAT may be before we reject.
     /// Saturates at the `std.Io.Duration` bounds; limiter initialization
     /// reports `error.TimeOverflow` if its internal representation is narrower.
-    pub fn burstOffset(self: Limit, burst: u32) std.Io.Duration {
+    fn burstOffset(self: Limit, burst: u32) std.Io.Duration {
         return .fromNanoseconds(
             self.emissionInterval().toNanoseconds() *| @as(i96, burst),
         );
@@ -121,26 +121,6 @@ pub const Clock = union(enum) {
             std.math.minInt(i64),
             std.math.maxInt(i64),
         ));
-    }
-};
-
-/// Reads the system's monotonic awake clock.
-///
-/// This clock cannot be adjusted like wall time and excludes time while the
-/// system is suspended. It uses the same clock as limiter wait operations.
-pub const SystemClock = struct {
-    io: std.Io,
-
-    /// Initialise a system clock with the provided I/O implementation.
-    /// In production, use `init.io` from `main(init: std.process.Init)`.
-    /// In tests, use `std.testing.io`.
-    pub fn init(io: std.Io) SystemClock {
-        return .{ .io = io };
-    }
-
-    /// Returns a movable clock that owns a copy of the `std.Io` interface.
-    pub fn clock(self: SystemClock) Clock {
-        return .{ .system = self.io };
     }
 };
 
@@ -346,60 +326,34 @@ test "Decision.retryAfterMillisecondsCeil rounds up safely" {
     );
 }
 
-test "SystemClock: monotonic non-decreasing without sleep" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
-
-    var prev = clk.now();
+test "Clock.system: monotonic non-decreasing" {
+    const clock = Clock{ .system = std.testing.io };
+    var prev = clock.now();
 
     var i: usize = 0;
     while (i < 10_000) : (i += 1) {
-        const now = clk.now();
+        const now = clock.now();
         try std.testing.expect(now >= prev);
         prev = now;
     }
 }
 
-test "SystemClock: uses the awake monotonic clock" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
-
+test "Clock.system: uses the awake monotonic clock" {
+    const clock = Clock{ .system = std.testing.io };
     const before = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
-    const actual = clk.now();
+    const actual = clock.now();
     const after = std.Io.Clock.awake.now(std.testing.io).toNanoseconds();
 
     try std.testing.expect(actual >= before);
     try std.testing.expect(actual <= after);
 }
 
-test "SystemClock: returns positive i64" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
-
-    const t = clk.now();
-    try std.testing.expect(t > 0);
+fn makeOwnedSystemClock(io: std.Io) Clock {
+    return .{ .system = io };
 }
 
-test "SystemClock: multiple calls are non-decreasing" {
-    var sys = SystemClock.init(std.testing.io);
-    const clk = sys.clock();
-
-    var prev = clk.now();
-
-    var i: usize = 0;
-    while (i < 1000) : (i += 1) {
-        const now = clk.now();
-        try std.testing.expect(now >= prev);
-        prev = now;
-    }
-}
-
-fn makeSystemClock(io: std.Io) Clock {
-    return SystemClock.init(io).clock();
-}
-
-test "SystemClock: returned Clock owns movable Io state" {
-    const clock = makeSystemClock(std.testing.io);
+test "Clock.system: owns movable Io state" {
+    const clock = makeOwnedSystemClock(std.testing.io);
     const first = clock.now();
     const second = clock.now();
 

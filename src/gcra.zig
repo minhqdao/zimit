@@ -1943,7 +1943,7 @@ test "AtomicLimiter: allowN with batch=2 on rate=10/s with burst" {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // We can't inject a ManualClock across threads safely (it has no internal
-// synchronisation), so the concurrency tests use SystemClock and reason
+// synchronisation), so the concurrency tests use the system clock and reason
 // about counts rather than exact timing.
 
 test "AtomicLimiter: concurrent allows never exceed limit" {
@@ -1954,11 +1954,10 @@ test "AtomicLimiter: concurrent allows never exceed limit" {
     const num_threads = 8;
     const requests_per_thread = 200;
 
-    var sys = types.SystemClock.init(std.testing.io);
     var lim = try AtomicLimiter.init(
         Limit.perSecond(1000),
         0,
-        sys.clock(),
+        .{ .system = std.testing.io },
     );
 
     const Ctx = struct {
@@ -2008,12 +2007,11 @@ test "AtomicLimiter: concurrent allows — no lost updates under contention" {
     const num_threads = 8;
     const requests_per_thread = 20; // 160 total attempts for 50 slots
 
-    var sys = types.SystemClock.init(std.testing.io);
     // Large period so slots don't replenish during the test
     var lim = try AtomicLimiter.init(
         Limit{ .count = total_slots, .period = .fromNanoseconds(std.time.ns_per_s) },
         total_slots - 1, // critical
-        sys.clock(),
+        .{ .system = std.testing.io },
     );
 
     const Ctx = struct {
