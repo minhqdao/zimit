@@ -42,7 +42,7 @@ jobs:
               run: python3 tools/zls_lint.py
 
     test:
-        name: ${{ matrix.os }} - Debug
+        name: ${{ matrix.os }} - Debug validation
         runs-on: ${{ matrix.os }}
         strategy:
             fail-fast: false
@@ -67,7 +67,7 @@ jobs:
             - run: zig build docs # just verifying they build
 
     release-safe:
-        name: ubuntu-latest - ReleaseSafe
+        name: ubuntu-latest - ReleaseSafe validation
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v7
