@@ -58,6 +58,10 @@ For an arbitrary period, initialize `Limit` directly with `count` and
 
 See [examples](examples) for more.
 
+Compile every example without running it using `zig build examples`. To run
+the examples as a smoke test, including the deliberately paced waiting example,
+use `zig build smoke`.
+
 ## Key types
 
 String keys are copied automatically, and integer keys work directly.

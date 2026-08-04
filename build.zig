@@ -36,8 +36,10 @@ pub fn build(b: *std.Build) void {
 
     // ── Examples ─────────────────────────────────────────────────────────────
     //
-    // Run all examples with `zig build examples`.
-    const examples_step = b.step("examples", "Build and run all examples");
+    // Compile examples without executing them. Use `zig build smoke` to run
+    // them, including examples that deliberately wait between admissions.
+    const examples_step = b.step("examples", "Compile all examples");
+    const smoke_step = b.step("smoke", "Build and run all examples");
 
     const example_names = [_][]const u8{
         "global-limiter",
@@ -58,8 +60,10 @@ pub fn build(b: *std.Build) void {
             }),
         });
 
+        examples_step.dependOn(&exe.step);
+
         const run = b.addRunArtifact(exe);
-        examples_step.dependOn(&run.step);
+        smoke_step.dependOn(&run.step);
     }
 
     // ── Docs ──────────────────────────────────────────────────────────────────
