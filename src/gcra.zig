@@ -588,6 +588,123 @@ pub const StringLimiter = Limiter([]const u8);
 // Tests — pure engine
 // ─────────────────────────────────────────────────────────────────────────────
 
+const TestOutcome = union(enum) {
+    allowed: i64,
+    denied: i64,
+    time_overflow,
+};
+
+fn referenceCheckN(
+    tat: i64,
+    now: i64,
+    interval: i64,
+    burst_offset: i64,
+    n: u32,
+) TestOutcome {
+    const new_tat = @as(i128, @max(tat, now)) +
+        @as(i128, interval) * @as(i128, n);
+    const allow_at = new_tat - @as(i128, burst_offset) - interval;
+
+    if (allow_at <= now) {
+        if (new_tat > std.math.maxInt(i64)) return .time_overflow;
+        return .{ .allowed = @intCast(new_tat) };
+    }
+
+    const retry_after = allow_at - @as(i128, now);
+    if (retry_after > std.math.maxInt(i64)) return .time_overflow;
+    return .{ .denied = @intCast(retry_after) };
+}
+
+fn engineCheckN(
+    tat: i64,
+    now: i64,
+    interval: i64,
+    burst_offset: i64,
+    n: u32,
+) TestOutcome {
+    const result = checkN(tat, now, interval, burst_offset, n) catch
+        return .time_overflow;
+    return switch (result) {
+        .allowed => |allowed| .{ .allowed = allowed.new_tat },
+        .denied => |denied| .{ .denied = @intCast(
+            denied.retry_after.toNanoseconds(),
+        ) },
+    };
+}
+
+fn expectMatchesReference(
+    tat: i64,
+    now: i64,
+    interval: i64,
+    burst_offset: i64,
+    n: u32,
+) !void {
+    try std.testing.expectEqualDeep(
+        referenceCheckN(tat, now, interval, burst_offset, n),
+        engineCheckN(tat, now, interval, burst_offset, n),
+    );
+}
+
+test "checkN: randomized admission matches reference model" {
+    var prng = std.Random.DefaultPrng.init(0x5a_49_4d_49_54);
+    const random = prng.random();
+
+    for (0..50_000) |_| {
+        const interval = random.intRangeAtMost(i64, 1, 1_000_000);
+        const burst = random.intRangeAtMost(i64, 0, 32);
+        const now = random.intRangeAtMost(i64, -1_000_000_000, 1_000_000_000);
+        const tat_delta = random.intRangeAtMost(i64, -2_000_000, 34_000_000);
+        const tat = now + tat_delta;
+        const n = random.intRangeAtMost(u32, 1, 40);
+
+        try expectMatchesReference(tat, now, interval, interval * burst, n);
+    }
+}
+
+test "checkN: fuzzed admission matches reference model" {
+    try std.testing.fuzz({}, fuzzCheckN, .{});
+}
+
+fn fuzzCheckN(_: void, smith: *std.testing.Smith) !void {
+    const tat = smith.value(i64);
+    const now = smith.value(i64);
+    const interval = smith.valueRangeAtMost(i64, 1, std.math.maxInt(i64));
+    const burst_offset = smith.valueRangeAtMost(i64, 0, std.math.maxInt(i64));
+    const n = smith.valueRangeAtMost(u32, 1, std.math.maxInt(u32));
+    try expectMatchesReference(tat, now, interval, burst_offset, n);
+}
+
+test "checkN: extreme timestamps and batches match reference model" {
+    const timestamps = [_]i64{
+        std.math.minInt(i64),
+        std.math.minInt(i64) + 1,
+        -1,
+        0,
+        1,
+        std.math.maxInt(i64) - 1,
+        std.math.maxInt(i64),
+    };
+    const intervals = [_]i64{ 1, 2, std.time.ns_per_s, std.math.maxInt(i64) };
+    const batches = [_]u32{ 1, 2, std.math.maxInt(u32) };
+
+    for (timestamps) |tat| {
+        for (timestamps) |now| {
+            for (intervals) |interval| {
+                for (batches) |n| {
+                    try expectMatchesReference(tat, now, interval, 0, n);
+                    try expectMatchesReference(
+                        tat,
+                        now,
+                        interval,
+                        std.math.maxInt(i64),
+                        n,
+                    );
+                }
+            }
+        }
+    }
+}
+
 test "check: fresh key is always allowed" {
     // tat=0, now=1s — any request on a fresh key must pass
     const d = try check(0, std.time.ns_per_s, 10_000_000, 0);
@@ -1258,38 +1375,39 @@ test "Limiter: checkKeyN rejects maxInt(u32)" {
     );
 }
 
-test "Limiter: OutOfMemory handling" {
+fn exerciseKeyedAllocations(allocator: std.mem.Allocator) !void {
     var mc = types.ManualClock{};
     mc.set(.fromNanoseconds(std.time.ns_per_s));
-
-    // Use a failing allocator to simulate OOM.
-    // std.testing.FailingAllocator fires after N successful allocations.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-
-    var lim = try StringLimiter.init(
-        failing.allocator(),
-        Limit.perSecond(10),
-        0,
-        mc.clock(),
+    var lim = try Limiter([]const u8).initWithConfigAndStorage(
+        allocator,
+        .{
+            .limit = Limit.perSecond(10),
+            .burst = 0,
+            .clock = mc.clock(),
+        },
+        .{ .idle_timeout = .fromSeconds(1) },
     );
     defer lim.deinit();
 
-    // 1. OOM on first key insertion (dupe fails or HashMap grow fails)
-    // We don't know exactly when it fails, so we loop and advance fail_index.
-    var i: u32 = 0;
-    while (i < 5) : (i += 1) {
-        failing.fail_index = i;
-        failing.alloc_index = 0;
-        const result = lim.checkKey("new-key");
-        if (result == error.OutOfMemory) break;
-    } else {
-        // If we never hit OOM in 5 steps, the test is weak or the fail_index logic is misunderstood.
-    }
+    var first_key = [_]u8{ 'a', 'l', 'p', 'h', 'a' };
+    try std.testing.expect((try lim.checkKey(&first_key)).isAllowed());
+    first_key[0] = 'X';
+    try std.testing.expect(!(try lim.checkKey("alpha")).isAllowed());
 
-    // 2. Ensure state is still consistent after OOM.
-    // Reset to successful allocator for a moment to check.
-    failing.fail_index = std.math.maxInt(usize);
-    try std.testing.expect((try lim.checkKey("healthy")).isAllowed());
+    try std.testing.expect((try lim.checkKey("beta")).isAllowed());
+    try std.testing.expectEqual(@as(usize, 2), lim.keyCount());
+
+    mc.tick(.fromSeconds(1));
+    try std.testing.expectEqual(@as(usize, 2), try lim.pruneExpired());
+    try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+}
+
+test "Limiter: every allocation failure is propagated without leaks" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        exerciseKeyedAllocations,
+        .{},
+    );
 }
 
 test "Limiter: init rejects negative period" {
@@ -1458,6 +1576,52 @@ test "Limiter: BatchTooLarge does not insert a fresh key" {
         lim.checkKeyN("new", std.math.maxInt(u32)),
     );
     try std.testing.expectEqual(@as(usize, 0), lim.keyCount());
+}
+
+const CollisionContext = struct {
+    pub fn hash(_: CollisionContext, _: u32) u64 {
+        return 0;
+    }
+
+    pub fn eql(_: CollisionContext, a: u32, b: u32) bool {
+        return a == b;
+    }
+};
+
+test "Limiter: collision-heavy context preserves independent keys" {
+    var mc = types.ManualClock{};
+    mc.set(.fromNanoseconds(std.time.ns_per_s));
+    const CollisionLimiter = LimiterWithContext(u32, CollisionContext);
+    var lim = try CollisionLimiter.initWithKeyOptions(
+        std.testing.allocator,
+        .{
+            .limit = Limit.perSecond(1),
+            .burst = 0,
+            .clock = mc.clock(),
+        },
+        .{},
+        .{},
+        .borrowed,
+    );
+    defer lim.deinit();
+
+    for (0..256) |key| {
+        try std.testing.expect((try lim.checkKey(@intCast(key))).isAllowed());
+    }
+    try std.testing.expectEqual(@as(usize, 256), lim.keyCount());
+
+    for (0..256) |key| {
+        try std.testing.expect(!(try lim.checkKey(@intCast(key))).isAllowed());
+    }
+
+    for (0..128) |i| lim.remove(@intCast(i * 2));
+    try std.testing.expectEqual(@as(usize, 128), lim.keyCount());
+
+    for (0..128) |i| {
+        try std.testing.expect((try lim.checkKey(@intCast(i * 2))).isAllowed());
+        try std.testing.expect(!(try lim.checkKey(@intCast(i * 2 + 1))).isAllowed());
+    }
+    try std.testing.expectEqual(@as(usize, 256), lim.keyCount());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
