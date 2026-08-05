@@ -13,17 +13,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ── Static library artifact (optional — for C consumers) ─────────────────
-    //
-    // Not needed for pure-Zig dependents, but useful if someone wants to
-    // link zimit into a C project. Produces zig-out/lib/libzimit.a.
-    const lib = b.addLibrary(.{
-        .name = "zimit",
-        .root_module = zimit_mod,
-        .linkage = .static,
-    });
-    b.installArtifact(lib);
-
     // ── Tests ─────────────────────────────────────────────────────────────────
     //
     // Tests imported by root.zig are discovered transitively by Zig.
@@ -70,8 +59,12 @@ pub fn build(b: *std.Build) void {
     //
     // `zig build docs` emits HTML documentation into zig-out/docs/.
     // Point your CI at this and upload to GitHub Pages / Codeberg Pages.
+    const docs_object = b.addObject(.{
+        .name = "zimit-docs",
+        .root_module = zimit_mod,
+    });
     const docs = b.addInstallDirectory(.{
-        .source_dir = lib.getEmittedDocs(),
+        .source_dir = docs_object.getEmittedDocs(),
         .install_dir = .prefix,
         .install_subdir = "docs",
     });
